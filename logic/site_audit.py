@@ -1,3 +1,4 @@
+# logic/site_audit.py
 import json
 import re
 import requests
@@ -41,9 +42,9 @@ Return JSON shape:
 """
 
 def _extract_text_from_html(html: str) -> str:
-    # remove scripts/styles
-    html = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\\1>", " ", html)
-    # remove tags
+    # remove scripts/styles/noscript blocks
+    html = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", html)
+    # remove all tags
     text = re.sub(r"(?is)<[^>]+>", " ", html)
     # normalize whitespace
     text = re.sub(r"\s+", " ", text).strip()
@@ -53,7 +54,7 @@ def fetch_page_text(url: str, timeout: int = 15) -> dict:
     r = requests.get(
         url,
         timeout=timeout,
-        headers={"User-Agent": "fiilthy/1.0 (+https://fiilthy.ai)"},
+        headers={"User-Agent": "fiilthy/1.0"},
         allow_redirects=True,
     )
     html = r.text or ""
@@ -61,7 +62,7 @@ def fetch_page_text(url: str, timeout: int = 15) -> dict:
     return {
         "final_url": r.url,
         "status": r.status_code,
-        "text_sample": text[:7000],  # keep it small for cost + speed
+        "text_sample": text[:7000],  # limit tokens/cost
     }
 
 def audit_site(url: str) -> dict:
@@ -85,7 +86,7 @@ def audit_site(url: str) -> dict:
 
     data = json.loads(resp.output_text)
 
-    # keep the payload meta (useful for debugging)
+    # keep meta for debugging
     data["_meta"] = {
         "final_url": page["final_url"],
         "http_status": page["status"],
