@@ -1,233 +1,120 @@
-import os
-import re
-import time
 from datetime import datetime, timezone
+from typing import Dict, Any, List
 
-import requests
+from config import DEFAULT_SUBREDDITS, DEFAULT_RSS_FEEDS, SERP_QUERIES
+from supabase_client import get_supabase, supabase_ready
+from utils import url_hash, safe_str
+from scoring import score, is_hard_negative
 
-try:
-    from supabase import create_client
-except Exception:
-    create_client = None
-
-
-# -----------------------------
-# ENV
-# -----------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()  # Use SERVICE_ROLE key on server
-
-USER_AGENT = os.getenv("FIILTHY_USER_AGENT", "fiilthy/1.0 (pythonanywhere)")
-HTTP_TIMEOUT = int(os.getenv("FIILTHY_HTTP_TIMEOUT", "12"))
-
-# Hard negatives (skip obvious non-leads)
-HARD_NEGATIVE_RE = re.compile(
-    r"\b(hiring|job\s+opening|career|resume|cv|apply\s+now|recruiter|internship)\b",
-    re.IGNORECASE,
-)
-
-# Basic intent keywords (very simple starter)
-HIGH_INTENT_RE = re.compile(
-    r"\b(need|looking for|recommend|anyone know|can someone|help me|want to buy|budget|quote|price)\b",
-    re.IGNORECASE,
-)
+from sources.serp import fetch_serp
+from sources.reddit import fetch_reddit
+from sources.hn import fetch_hn
+from sources.rss import fetch_rss
 
 
-# -----------------------------
-# Supabase client
-# -----------------------------
-_supabase = None
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
-def check_supabase_ready() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_KEY and create_client is not None)
+def normalize(item: Dict[str, Any]) -> Dict[str, Any]:
+    url = (item.get("url") or "").strip()
+
+    if not url:
+        return {}
+
+    title = safe_str(item.get("title"), 500)
+    content = safe_str(item.get("content"), 4000)
+
+    text = f"{title}\n{content}"
+
+    if is_hard_negative(text):
+        return {}
+
+    s, category, buyer_signal, keywords = score(text)
+
+    intent = "high" if s >= 70 else "medium" if s >= 45 else "low"
+
+    return {
+        "url": url,
+        "url_hash": url_hash(url),
+        "title": title,
+        "content": content,
+        "source": item.get("source") or "",
+        "author": item.get("author") or "",
+        "score": s,
+        "intent": intent,
+        "category": category,
+        "buyer_signal": buyer_signal,
+        "hard_negative": False,
+        "keywords": keywords,
+        "raw": item.get("raw") or {},
+        "last_seen_at": now_iso(),
+        "created_at": now_iso(),
+    }
 
 
-def get_supabase():
-    global _supabase
-    if _supabase is None:
-        if not check_supabase_ready():
-            raise RuntimeError("Supabase not configured. Set SUPABASE_URL and SUPABASE_KEY.")
-        _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return _supabase
-
-
-# -----------------------------
-# Source fetchers
-# -----------------------------
-def fetch_hn_leads(limit=20):
-    """
-    Hacker News via Algolia search API (public).
-    We search for keywords that often indicate someone wants help/tools/services.
-    """
-    q = "looking for OR need OR recommend OR quote OR pricing"
-    url = "https://hn.algolia.com/api/v1/search"
-    params = {"query": q, "tags": "story", "hitsPerPage": limit}
-    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
-    r.raise_for_status()
-    data = r.json()
-    hits = data.get("hits", [])
+def gather():
     items = []
-    for h in hits:
-        title = (h.get("title") or "").strip()
-        story_url = (h.get("url") or "").strip() or f"https://news.ycombinator.com/item?id={h.get('objectID')}"
-        content = (h.get("story_text") or "").strip()
-        if not title and not content:
-            continue
-        items.append(
-            {
-                "title": title[:500],
-                "content": (content or title)[:4000],
-                "source": "hackernews",
-                "url": story_url,
-            }
-        )
-    return items
+    errors = []
 
+    # SERP
+    for q in SERP_QUERIES:
+        try:
+            items += fetch_serp(q, limit=20)
+        except Exception as e:
+            errors.append(str(e))
 
-def fetch_reddit_leads(subreddit="entrepreneur", limit=20):
-    """
-    Reddit JSON endpoint (no auth) — can work, but sometimes rate-limited.
-    """
-    url = f"https://www.reddit.com/r/{subreddit}/new.json"
-    params = {"limit": limit}
-    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
-    r.raise_for_status()
-    data = r.json()
-    children = (data.get("data") or {}).get("children") or []
-    items = []
-    for c in children:
-        p = (c.get("data") or {})
-        title = (p.get("title") or "").strip()
-        selftext = (p.get("selftext") or "").strip()
-        permalink = p.get("permalink")
-        full_url = f"https://www.reddit.com{permalink}" if permalink else (p.get("url") or "")
-        if not title and not selftext:
-            continue
-        items.append(
-            {
-                "title": title[:500],
-                "content": (selftext or title)[:4000],
-                "source": f"reddit:r/{subreddit}",
-                "url": full_url,
-            }
-        )
-    return items
+    # Reddit
+    for sub in DEFAULT_SUBREDDITS:
+        try:
+            items += fetch_reddit(sub, limit=20)
+        except Exception as e:
+            errors.append(str(e))
 
-
-# -----------------------------
-# Scoring / intent (starter)
-# -----------------------------
-def detect_intent(text: str) -> str:
-    if not text:
-        return "unknown"
-    if HIGH_INTENT_RE.search(text):
-        return "high"
-    return "low"
-
-
-def score_lead(title: str, content: str) -> int:
-    text = f"{title}\n{content}".lower()
-    score = 0
-
-    # High-intent words
-    if HIGH_INTENT_RE.search(text):
-        score += 40
-
-    # Words that often mean someone is ready to spend
-    if any(k in text for k in ["budget", "quote", "pricing", "price", "pay", "invoice"]):
-        score += 30
-
-    # Longer content usually has more detail
-    if len(content or "") > 300:
-        score += 10
-    if len(content or "") > 800:
-        score += 10
-
-    # Clamp 0-100
-    return max(0, min(100, score))
-
-
-def is_hard_negative(text: str) -> bool:
-    if not text:
-        return False
-    return bool(HARD_NEGATIVE_RE.search(text))
-
-
-# -----------------------------
-# Insert into Supabase
-# -----------------------------
-def insert_leads(leads):
-    """
-    Inserts into public.leads.
-    Your table columns: title, content, source, url, score, intent, created_at
-    We use upsert on url to avoid duplicates.
-    """
-    sb = get_supabase()
-
-    inserted = 0
-    for lead in leads:
-        title = lead.get("title") or ""
-        content = lead.get("content") or ""
-        source = lead.get("source") or ""
-        url = (lead.get("url") or "").strip()
-
-        if not url:
-            continue
-
-        full_text = f"{title}\n{content}"
-        if is_hard_negative(full_text):
-            continue
-
-        intent = detect_intent(full_text)
-        score = score_lead(title, content)
-
-        row = {
-            "title": title,
-            "content": content,
-            "source": source,
-            "url": url,
-            "score": score,
-            "intent": intent,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        # Upsert by url (url is UNIQUE)
-        resp = sb.table("leads").upsert(row, on_conflict="url").execute()
-
-        # supabase-py returns data when insert/upsert occurs; duplicates may still return data depending on version.
-        # We'll estimate inserted by checking response contains a row AND that it’s not an update:
-        # (Not perfect across all versions; still fine for ops.)
-        if getattr(resp, "data", None):
-            inserted += 1
-
-        # small pause to avoid rate limiting or bursts
-        time.sleep(0.1)
-
-    return inserted
-
-
-# -----------------------------
-# Main scan function
-# -----------------------------
-def run_scan():
-    """
-    Returns dict: {ok, inserted, error, ts}
-    """
-    ts = datetime.now(timezone.utc).isoformat()
-
-    if not check_supabase_ready():
-        return {"ok": False, "inserted": 0, "error": "Supabase not configured", "ts": ts}
-
+    # Hacker News
     try:
-        leads = []
-        # Add sources you want:
-        leads += fetch_hn_leads(limit=20)
-        leads += fetch_reddit_leads(subreddit="entrepreneur", limit=20)
-        leads += fetch_reddit_leads(subreddit="smallbusiness", limit=20)
-
-        inserted = insert_leads(leads)
-        return {"ok": True, "inserted": inserted, "error": None, "ts": ts}
-
+        items += fetch_hn(limit=20)
     except Exception as e:
-        return {"ok": False, "inserted": 0, "error": str(e), "ts": ts}
+        errors.append(str(e))
+
+    # RSS (Indie Hackers)
+    for feed in DEFAULT_RSS_FEEDS:
+        try:
+            items += fetch_rss(feed, limit=20)
+        except Exception as e:
+            errors.append(str(e))
+
+    return items, errors
+
+
+def run_scan():
+    ts = now_iso()
+
+    if not supabase_ready():
+        return {"ok": False, "error": "Supabase not configured"}
+
+    items, errors = gather()
+
+    rows = []
+
+    for item in items:
+        row = normalize(item)
+
+        if row:
+            rows.append(row)
+
+    if rows:
+        sb = get_supabase()
+
+        sb.table("leads").upsert(
+            rows,
+            on_conflict="url_hash"
+        ).execute()
+
+    return {
+        "ok": True,
+        "total_found": len(items),
+        "stored": len(rows),
+        "errors": errors,
+        "ts": ts
+    }
