@@ -1,43 +1,27 @@
-# app.py
-# FIILTHY backend API (Flask) — plugs into your /logic modules + Supabase.
+# app.py — FIILTHY backend API (Flask) aligned to Supabase "projects" schema
 #
-# What this gives you:
-# - Create companies (URL + keywords/niche/locations)
-# - Run scans (HN/Reddit optional + SERP “everywhere”)
-# - Insert leads into Supabase (dedupe via upsert on url)
-# - Scoring + reasons (logic/scoring.py)
-# - Query builder (logic/query_builder.py)
-# - Query + URL caching (logic/cache.py)
-# - Billing quotas (logic/billing.py)
-# - Notifications (logic/notify.py)
-# - Referrals (logic/referrals.py)
+# Tables expected in Supabase:
+# - projects (id, owner_id, name, url, niche, keywords, locations, created_at)
+# - leads (id, project_id, title, content, source, url, deep_link, status, score, intent, reasons, analysis, why_this_is_a_lead, last_analyzed_at, created_at)
+# - site_audits (id, project_id, target_url, fetched_at, summary, positioning, issues, quick_wins, suggested_copy)
+# - usage_counters (optional, used by billing.py)
 #
 # Env vars required:
 #   SUPABASE_URL
-#   SUPABASE_KEY   (SERVICE_ROLE key recommended on server)
-#
-# Optional SERP provider env vars (pick ONE):
-#   SERPAPI_KEY                 (SerpApi)
-#   SERPER_API_KEY              (Serper.dev)
-#
-# Security / access:
-#   FIILTHY_API_KEY             (recommended; clients must send X-API-Key header)
-#
-# Email alerts (optional, for logic/notify.py):
-#   SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_FROM
-#   ALERT_SCORE_THRESHOLD (default 75)
+#   SUPABASE_KEY  (SERVICE_ROLE recommended on server)
+# Optional:
+#   FIILTHY_API_KEY (if set, clients must send X-API-Key)
+# SERP providers (pick ONE):
+#   SERPAPI_KEY
+#   SERPER_API_KEY
 #
 # Run:
 #   python app.py
-#
-# Notes:
-# - This file does NOT do Supabase auth/JWT verification. It uses X-API-Key.
-#   For launch, you can add Supabase JWT verification later.
 
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from flask import Flask, jsonify, request
@@ -47,7 +31,7 @@ try:
 except Exception:
     create_client = None
 
-# logic modules you created
+# Existing logic modules
 from logic.query_builder import build_queries, CompanyProfile
 from logic.scoring import score_lead
 from logic.cache import filter_queries, mark_query_run
@@ -55,6 +39,9 @@ from logic.billing import can_use, consume
 from logic.notify import maybe_alert_hot_lead
 from logic.referrals import ensure_referral_code, attribute_referral
 
+# New AI modules
+from logic.site_audit import audit_site
+from logic.lead_ai import analyze_lead
 
 # -----------------------------
 # Config
@@ -64,19 +51,15 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 
 FIILTHY_API_KEY = os.getenv("FIILTHY_API_KEY", "").strip()
 
-# SERP providers
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "").strip()         # serpapi.com
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()   # serper.dev
 
 HTTP_TIMEOUT = int(os.getenv("FIILTHY_HTTP_TIMEOUT", "20"))
 MAX_SERP_QUERIES_PER_SCAN = int(os.getenv("MAX_SERP_QUERIES_PER_SCAN", "20"))
 SERP_RESULTS_PER_QUERY = int(os.getenv("SERP_RESULTS_PER_QUERY", "10"))
-
-# Optional: slow down to avoid bursts
 SERP_SLEEP_SECONDS = float(os.getenv("SERP_SLEEP_SECONDS", "0.2"))
 
 app = Flask(__name__)
-
 
 # -----------------------------
 # Supabase
@@ -92,27 +75,23 @@ def get_supabase():
     _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _supabase
 
-
 # -----------------------------
 # Security (simple API key)
 # -----------------------------
 def require_api_key():
     if not FIILTHY_API_KEY:
-        return  # not enforced if you didn't set it (not recommended)
+        return
     key = request.headers.get("X-API-Key", "").strip()
     if key != FIILTHY_API_KEY:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-
 @app.before_request
 def _auth_middleware():
-    # Allow health without key
     if request.path in ["/health", "/"]:
         return
     resp = require_api_key()
     if resp:
         return resp
-
 
 # -----------------------------
 # Utilities
@@ -126,10 +105,8 @@ def _clean_list(val) -> List[str]:
     if isinstance(val, list):
         return [str(x).strip() for x in val if str(x).strip()]
     if isinstance(val, str):
-        # allow comma-separated
         return [x.strip() for x in val.split(",") if x.strip()]
     return [str(val).strip()] if str(val).strip() else []
-
 
 # -----------------------------
 # SERP Fetchers
@@ -181,38 +158,42 @@ def fetch_serp_results(query: str, per_query: int = SERP_RESULTS_PER_QUERY) -> L
             out.append({"title": title, "url": url, "snippet": snippet, "source": "serp/google"})
         return out
 
-    # No provider configured
     return []
-
 
 # -----------------------------
 # DB helpers
 # -----------------------------
-def upsert_company(sb, user_id: str, payload: dict) -> dict:
+def upsert_project(sb, payload: dict) -> dict:
     """
-    Creates/updates a company row.
+    Creates/updates a project row.
+    Required: owner_id (or user_id), name, url
+    Optional: niche, keywords, locations
     """
+    owner_id = (payload.get("owner_id") or payload.get("user_id") or "").strip()
+    name = (payload.get("name") or "").strip()
     url = (payload.get("url") or "").strip()
+
+    if not owner_id:
+        raise ValueError("owner_id (or user_id) is required")
+    if not name:
+        raise ValueError("name is required")
     if not url:
         raise ValueError("url is required")
 
     row = {
-        "user_id": user_id,
+        "owner_id": owner_id,
+        "name": name,
         "url": url,
-        "name": (payload.get("name") or "").strip() or None,
         "niche": (payload.get("niche") or "").strip() or None,
         "keywords": _clean_list(payload.get("keywords")),
         "locations": _clean_list(payload.get("locations")),
         "created_at": now_iso(),
     }
 
-    # If you have a unique constraint on (user_id, url) you can use on_conflict="user_id,url"
-    # If not, simplest is insert and let duplicates exist — but not recommended.
-    # We'll try upsert on url (assuming url is unique in your companies table).
-    resp = sb.table("companies").upsert(row, on_conflict="url").execute()
-    data = (resp.data or [])
+    # assumes unique(url) in projects, adjust if your constraint differs
+    resp = sb.table("projects").upsert(row, on_conflict="url").execute()
+    data = resp.data or []
     return data[0] if data else row
-
 
 def insert_lead(sb, row: dict) -> Optional[dict]:
     """
@@ -220,60 +201,46 @@ def insert_lead(sb, row: dict) -> Optional[dict]:
     """
     if not row.get("url"):
         return None
-
     resp = sb.table("leads").upsert(row, on_conflict="url").execute()
     data = resp.data or []
     return data[0] if data else row
 
-
-def list_leads(sb, company_id: Optional[str] = None, limit: int = 50) -> List[dict]:
+def list_leads(sb, project_id: Optional[str] = None, limit: int = 50) -> List[dict]:
     q = sb.table("leads").select("*").order("created_at", desc=True).limit(limit)
-    if company_id:
-        q = q.eq("company_id", company_id)
+    if project_id:
+        q = q.eq("project_id", project_id)
     resp = q.execute()
     return resp.data or []
-
 
 # -----------------------------
 # Core scan logic
 # -----------------------------
-def run_company_scan(
+def run_project_scan(
     sb,
     *,
     user_id: str,
     user_email: str,
-    company: dict,
+    project: dict,
     max_queries: int = MAX_SERP_QUERIES_PER_SCAN,
     per_query: int = SERP_RESULTS_PER_QUERY,
 ) -> Dict[str, Any]:
-    """
-    Build queries -> cache filter -> enforce billing -> fetch SERP -> score -> insert -> notify.
-    """
-    company_id = company.get("id")
+    project_id = project.get("id")
+
     profile = CompanyProfile(
-        url=company.get("url") or "",
-        name=company.get("name"),
-        niche=company.get("niche"),
-        keywords=tuple(company.get("keywords") or ()),
-        locations=tuple(company.get("locations") or ()),
+        url=project.get("url") or "",
+        name=project.get("name"),
+        niche=project.get("niche"),
+        keywords=tuple(project.get("keywords") or ()),
+        locations=tuple(project.get("locations") or ()),
     )
 
-    queries = build_queries(profile, max_queries=max_queries)
-    queries = queries[:max_queries]
-
-    # cache-filter queries (24h cooldown)
+    queries = build_queries(profile, max_queries=max_queries)[:max_queries]
     queries = filter_queries(sb, queries)
 
-    # Billing: SERP queries quota
     if queries:
         if not can_use(sb, user_id, "serp_queries", amount=len(queries)):
-            return {
-                "ok": False,
-                "error": "SERP quota exceeded for this user/plan",
-                "queries_attempted": len(queries),
-                "inserted": 0,
-            }
-        consume(sb, user_id, "serp_queries", amount=len(queries), meta={"company_id": company_id})
+            return {"ok": False, "error": "SERP quota exceeded", "queries_attempted": len(queries), "inserted": 0}
+        consume(sb, user_id, "serp_queries", amount=len(queries), meta={"project_id": project_id})
 
     inserted = 0
     errors: List[str] = []
@@ -301,11 +268,13 @@ def run_company_scan(
                 )
 
                 lead_row = {
-                    "company_id": company_id,
+                    "project_id": project_id,
                     "title": title[:500],
                     "content": snippet[:4000],
                     "source": source,
                     "url": url,
+                    "deep_link": url,     # click → exact lead page
+                    "status": "new",
                     "score": score,
                     "intent": intent,
                     "reasons": reasons,
@@ -314,12 +283,8 @@ def run_company_scan(
 
                 saved = insert_lead(sb, lead_row)
                 if saved:
-                    # Not perfect (upsert may return row even if it was an update),
-                    # but good enough for now. You can later compare timestamps.
                     inserted += 1
 
-                    # Billing: notifications (only if we actually attempt to send)
-                    # maybe_alert_hot_lead has its own "send once" guard via notifications table.
                     if can_use(sb, user_id, "notifications", amount=1):
                         sent = maybe_alert_hot_lead(
                             sb,
@@ -334,21 +299,14 @@ def run_company_scan(
                             channel="email",
                         )
                         if sent:
-                            consume(sb, user_id, "notifications", amount=1, meta={"company_id": company_id})
+                            consume(sb, user_id, "notifications", amount=1, meta={"project_id": project_id})
 
             time.sleep(SERP_SLEEP_SECONDS)
 
         except Exception as e:
             errors.append(f"{q[:80]}... -> {str(e)}")
 
-    return {
-        "ok": True,
-        "company_id": company_id,
-        "queries_ran": len(queries),
-        "inserted": inserted,
-        "errors": errors[:10],
-    }
-
+    return {"ok": True, "project_id": project_id, "queries_ran": len(queries), "inserted": inserted, "errors": errors[:10]}
 
 # -----------------------------
 # Routes
@@ -356,7 +314,6 @@ def run_company_scan(
 @app.get("/")
 def index():
     return jsonify({"ok": True, "service": "fiilthy-backend"})
-
 
 @app.get("/health")
 def health():
@@ -369,69 +326,61 @@ def health():
         err = str(e)
     return jsonify({"ok": ok, "supabase": ok, "error": err})
 
-
+# --- Referral endpoints ---
 @app.post("/users/<user_id>/referral-code")
 def api_referral_code(user_id):
     sb = get_supabase()
     code = ensure_referral_code(sb, user_id)
     return jsonify({"ok": True, "referral_code": code})
 
-
 @app.post("/users/<user_id>/apply-referral")
 def api_apply_referral(user_id):
-    """
-    Body: { "referral_code": "ABC12345" }
-    Attributes referral to this user if not already set.
-    """
     sb = get_supabase()
     body = request.get_json(force=True) or {}
     code = (body.get("referral_code") or "").strip()
     if not code:
         return jsonify({"ok": False, "error": "referral_code required"}), 400
-
     ok = attribute_referral(sb, user_id, code)
     return jsonify({"ok": True, "attributed": ok})
 
-
-@app.post("/companies")
-def api_create_company():
+# --- Projects ---
+@app.post("/projects")
+def api_create_project():
     """
     Body must include:
-      user_id, user_email, url
+      owner_id (or user_id), user_email, name, url
     Optional:
-      name, niche, keywords[], locations[]
+      niche, keywords[], locations[]
     """
     sb = get_supabase()
     body = request.get_json(force=True) or {}
 
-    user_id = (body.get("user_id") or "").strip()
     user_email = (body.get("user_email") or "").strip()
-    if not user_id or not user_email:
-        return jsonify({"ok": False, "error": "user_id and user_email required"}), 400
+    if not user_email:
+        return jsonify({"ok": False, "error": "user_email required"}), 400
 
     try:
-        company = upsert_company(sb, user_id, body)
-        return jsonify({"ok": True, "company": company})
+        project = upsert_project(sb, body)
+        return jsonify({"ok": True, "project": project})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
-
-@app.get("/companies")
-def api_list_companies():
+@app.get("/projects")
+def api_list_projects():
     """
-    Query params: user_id=...
+    Query params: owner_id=... (or user_id)
     """
     sb = get_supabase()
-    user_id = (request.args.get("user_id") or "").strip()
-    if not user_id:
-        return jsonify({"ok": False, "error": "user_id required"}), 400
+    owner_id = (request.args.get("owner_id") or request.args.get("user_id") or "").strip()
+    if not owner_id:
+        return jsonify({"ok": False, "error": "owner_id required"}), 400
 
-    resp = sb.table("companies").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
-    return jsonify({"ok": True, "companies": resp.data or []})
+    resp = sb.table("projects").select("*").eq("owner_id", owner_id).order("created_at", desc=True).execute()
+    return jsonify({"ok": True, "projects": resp.data or []})
 
-
-@app.post("/companies/<company_id>/scan")
-def api_scan_company(company_id):
+# --- Scan ---
+@app.post("/projects/<project_id>/scan")
+def api_scan_project(project_id):
     """
     Body must include:
       user_id, user_email
@@ -446,64 +395,141 @@ def api_scan_company(company_id):
     if not user_id or not user_email:
         return jsonify({"ok": False, "error": "user_id and user_email required"}), 400
 
-    # Billing: scans quota
     if not can_use(sb, user_id, "scans", amount=1):
-        return jsonify({"ok": False, "error": "Scan quota exceeded for this user/plan"}), 402
-    consume(sb, user_id, "scans", amount=1, meta={"company_id": company_id})
+        return jsonify({"ok": False, "error": "Scan quota exceeded"}), 402
+    consume(sb, user_id, "scans", amount=1, meta={"project_id": project_id})
 
-    # fetch company
-    resp = sb.table("companies").select("*").eq("id", company_id).limit(1).execute()
+    resp = sb.table("projects").select("*").eq("id", project_id).limit(1).execute()
     rows = resp.data or []
     if not rows:
-        return jsonify({"ok": False, "error": "Company not found"}), 404
-
-    company = rows[0]
+        return jsonify({"ok": False, "error": "Project not found"}), 404
+    project = rows[0]
 
     max_q = int(body.get("max_queries") or MAX_SERP_QUERIES_PER_SCAN)
     per_q = int(body.get("per_query") or SERP_RESULTS_PER_QUERY)
 
-    # Must have SERP provider configured
     if not SERPAPI_KEY and not SERPER_API_KEY:
         return jsonify({"ok": False, "error": "No SERP provider configured. Set SERPAPI_KEY or SERPER_API_KEY."}), 500
 
-    result = run_company_scan(
+    result = run_project_scan(
         sb,
         user_id=user_id,
         user_email=user_email,
-        company=company,
+        project=project,
         max_queries=max_q,
         per_query=per_q,
     )
     return jsonify(result)
 
-
+# --- Leads list ---
 @app.get("/leads")
 def api_list_leads():
     """
     Query params:
-      company_id (optional)
+      project_id (optional)
       limit (optional)
     """
     sb = get_supabase()
-    company_id = (request.args.get("company_id") or "").strip() or None
+    project_id = (request.args.get("project_id") or "").strip() or None
     limit = int(request.args.get("limit") or "50")
     limit = max(1, min(200, limit))
-    leads = list_leads(sb, company_id=company_id, limit=limit)
+    leads = list_leads(sb, project_id=project_id, limit=limit)
     return jsonify({"ok": True, "leads": leads})
 
+# --- Site Audit (pain points) ---
+@app.post("/projects/<project_id>/audit")
+def api_audit_project(project_id):
+    """
+    Body must include:
+      user_id, user_email
+    Optional:
+      target_url (defaults to project.url)
+    """
+    sb = get_supabase()
+    body = request.get_json(force=True) or {}
 
+    user_id = (body.get("user_id") or "").strip()
+    user_email = (body.get("user_email") or "").strip()
+    if not user_id or not user_email:
+        return jsonify({"ok": False, "error": "user_id and user_email required"}), 400
+
+    resp = sb.table("projects").select("*").eq("id", project_id).limit(1).execute()
+    rows = resp.data or []
+    if not rows:
+        return jsonify({"ok": False, "error": "Project not found"}), 404
+    project = rows[0]
+
+    target_url = (body.get("target_url") or project.get("url") or "").strip()
+    if not target_url:
+        return jsonify({"ok": False, "error": "Project has no url"}), 400
+
+    audit = audit_site(target_url)
+
+    sb.table("site_audits").insert({
+        "project_id": project_id,
+        "target_url": target_url,
+        "summary": audit.get("summary"),
+        "positioning": audit.get("positioning"),
+        "issues": audit.get("issues"),
+        "quick_wins": audit.get("quick_wins"),
+        "suggested_copy": audit.get("suggested_copy"),
+    }).execute()
+
+    return jsonify({"ok": True, "project_id": project_id, "audit": audit})
+
+# --- Lead AI analysis + human drafts ---
+@app.post("/leads/<lead_id>/analyze")
+def api_analyze_lead(lead_id):
+    sb = get_supabase()
+    body = request.get_json(force=True) or {}
+
+    user_id = (body.get("user_id") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id required"}), 400
+
+    # fetch lead
+    resp = sb.table("leads").select("*").eq("id", lead_id).limit(1).execute()
+    rows = resp.data or []
+    if not rows:
+        return jsonify({"ok": False, "error": "Lead not found"}), 404
+
+    lead = rows[0]
+    project_id = lead.get("project_id")
+    if not project_id:
+        return jsonify({"ok": False, "error": "Lead missing project_id"}), 400
+
+    # latest audit positioning
+    audit_resp = (
+        sb.table("site_audits")
+        .select("*")
+        .eq("project_id", project_id)
+        .order("fetched_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    audits = audit_resp.data or []
+    positioning = audits[0].get("positioning") if audits else {}
+
+    analysis = analyze_lead(lead, positioning)
+
+    sb.table("leads").update({
+        "score": analysis.get("score", lead.get("score", 0)),
+        "why_this_is_a_lead": analysis.get("why_this_is_a_lead", ""),
+        "analysis": analysis,
+        "status": "drafted",
+        "last_analyzed_at": now_iso(),
+    }).eq("id", lead_id).execute()
+
+    return jsonify({"ok": True, "lead_id": lead_id, "analysis": analysis})
+
+# --- Usage ---
 @app.get("/usage")
 def api_usage():
-    """
-    Query params: user_id=...
-    Returns current usage counters row (if you created usage_counters table).
-    """
     sb = get_supabase()
     user_id = (request.args.get("user_id") or "").strip()
     if not user_id:
         return jsonify({"ok": False, "error": "user_id required"}), 400
 
-    # just dump usage_counters for current rolling period_start used by billing.py
     from logic.billing import current_period_start
     start_iso = current_period_start().isoformat()
 
@@ -518,11 +544,9 @@ def api_usage():
     row = (resp.data or [])
     return jsonify({"ok": True, "period_start": start_iso, "usage": row[0] if row else {}})
 
-
 # -----------------------------
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    # Local run (PythonAnywhere web app uses WSGI instead)
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
