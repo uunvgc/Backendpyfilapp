@@ -1,5 +1,5 @@
-fastapi
-uvicorn[standard]
+flask
+gunicorn
 requests
 beautifulsoup4
 supabase
