@@ -1,47 +1,3 @@
-# app.py — FIILTHY backend API (Flask) — FULL (AUTO MODE + MULTI-SOURCE, BILLING OFF)
-#
-# Included:
-# ✅ Projects (1 project = 1 URL)
-# ✅ Create/List/Modify/Delete projects
-# ✅ Multi-source scanning:
-#    - Google SERP (SerpApi or Serper.dev)
-#    - Reddit (public search.json)
-#    - Hacker News (Algolia)
-#    - IndieHackers (RSS + keyword filtering)
-# ✅ Insert leads (dedupe by url unique)
-# ✅ Rule scoring + AI analysis + blended score
-# ✅ deep_link always points to the exact place to reply
-# ✅ Site audit endpoint saves pain points + copy suggestions
-# ✅ Manual lead analyze endpoint
-# ✅ AUTO MODE background worker:
-#    - scans + analyzes + queues best leads
-#    - safe pacing + daily caps
-#    - single-worker lock in Supabase
-#
-# REQUIRED ENV:
-#   SUPABASE_URL
-#   SUPABASE_KEY  (SERVICE_ROLE recommended on server)
-#
-# Optional:
-#   FIILTHY_API_KEY (X-API-Key)
-#
-# SERP provider (pick ONE):
-#   SERPAPI_KEY
-#   SERPER_API_KEY
-#
-# OpenAI:
-#   OPENAI_API_KEY (used by logic/site_audit.py and logic/lead_ai.py)
-#
-# Auto mode:
-#   AUTO_WORKER_ENABLED=true|false (default true)
-#   AUTO_WORKER_POLL_SECONDS=15
-#   AUTO_PROJECT_SCAN_INTERVAL_MIN=30
-#   AUTO_DAILY_CAP_DEFAULT=25
-#   AUTO_QUEUE_MIN_SCORE=60
-#
-# Source defaults:
-#   DEFAULT_SOURCES=serp,reddit,hn,indiehackers
-
 import os
 import time
 import random
@@ -95,6 +51,8 @@ DEFAULT_SOURCES = [s.strip() for s in os.getenv("DEFAULT_SOURCES", "serp,reddit,
 
 AUTO_LOCK_KEY = "auto_worker"
 AUTO_LOCK_TTL_SECONDS = int(os.getenv("AUTO_LOCK_TTL_SECONDS", "60"))
+
+ALLOWED_LEAD_STATUSES = {"new", "drafted", "queued", "approved", "sent", "replied", "closed", "lost"}
 
 app = Flask(__name__)
 
@@ -163,6 +121,9 @@ def day_key(dt: Optional[datetime] = None) -> str:
 
 def _sleep_jitter(a=0.2, b=1.0):
     time.sleep(random.uniform(a, b))
+
+def _clean_status(s: str) -> str:
+    return (s or "").strip().lower()
 
 
 # -----------------------------
@@ -343,18 +304,12 @@ def acquire_or_renew_lock(sb, holder_id: str) -> bool:
 # Source selection
 # -----------------------------
 def project_sources(project: dict) -> List[str]:
-    # optional project column "sources" as text[] (recommended)
     s = project.get("sources")
     if isinstance(s, list) and s:
         return [str(x).strip() for x in s if str(x).strip()]
     return DEFAULT_SOURCES
 
-
 def fetch_from_sources(query: str, project: dict, per_source: int = 10) -> List[Dict[str, str]]:
-    """
-    Returns normalized results:
-      {title, url, deep_link, snippet, source}
-    """
     sources = project_sources(project)
     out: List[Dict[str, str]] = []
 
@@ -368,18 +323,15 @@ def fetch_from_sources(query: str, project: dict, per_source: int = 10) -> List[
         out.extend(fetch_hn(query, limit=per_source, timeout=HTTP_TIMEOUT))
 
     if "indiehackers" in sources:
-        # RSS is not queryable; we filter by project keywords + niche + query tokens
         kws = []
         kws.extend(_clean_list(project.get("keywords")))
         if project.get("niche"):
             kws.append(str(project.get("niche")))
-        # also add a couple tokens from the query to help filter
         for tok in query.split():
             if len(tok) >= 4:
                 kws.append(tok)
         out.extend(fetch_indiehackers_rss(kws, limit=per_source, timeout=HTTP_TIMEOUT))
 
-    # light dedupe within batch by deep_link/url
     seen = set()
     deduped = []
     for r in out:
@@ -431,12 +383,11 @@ def run_project_scan(
 
             for res in results:
                 title = (res.get("title") or "").strip()
-                url = (res.get("url") or "").strip()
-                deep_link = (res.get("deep_link") or url).strip()
+                deep_link = (res.get("deep_link") or res.get("url") or "").strip()
                 snippet = (res.get("snippet") or "").strip()
                 source = res.get("source") or "unknown"
 
-                if not url or not title:
+                if not deep_link or not title:
                     continue
 
                 base_score, intent, reasons = score_lead(
@@ -452,7 +403,7 @@ def run_project_scan(
                     "title": title[:500],
                     "content": snippet[:4000],
                     "source": source,
-                    "url": deep_link,         # store deep link as the canonical URL
+                    "url": deep_link,
                     "deep_link": deep_link,
                     "status": "new",
                     "score": base_score,
@@ -563,7 +514,6 @@ def _auto_worker_loop():
 
                 cap = _safe_int(p.get("auto_daily_cap"), AUTO_DAILY_CAP_DEFAULT)
                 sent_today = _safe_int(p.get("auto_sent_today"), 0)
-
                 if sent_today >= cap:
                     actions["skipped_cap"] += 1
                     continue
@@ -601,10 +551,8 @@ def _auto_worker_loop():
                     set_auto_last_scan(sb, project_id)
                     actions["scanned"] += 1
                     actions["queued"] += _safe_int(res.get("queued"), 0)
-
                     if _safe_int(res.get("queued"), 0) > 0:
                         bump_auto_count(sb, project_id, delta=_safe_int(res.get("queued"), 0))
-
                 except Exception as e:
                     print("Auto scan error:", e)
 
@@ -646,7 +594,7 @@ def auto_status():
     return jsonify({"ok": True, "state": _AUTO_STATE})
 
 
-# --- Referral endpoints (kept for later) ---
+# --- Referral endpoints ---
 @app.post("/users/<user_id>/referral-code")
 def api_referral_code(user_id):
     sb = get_supabase()
@@ -692,6 +640,10 @@ def api_create_project():
         }
         if "sources" in body:
             update["sources"] = _clean_list(body.get("sources"))
+        if "auto_mode" in body:
+            update["auto_mode"] = bool(body.get("auto_mode"))
+        if "auto_daily_cap" in body:
+            update["auto_daily_cap"] = _safe_int(body.get("auto_daily_cap"), AUTO_DAILY_CAP_DEFAULT)
 
         saved = sb.table("projects").update(update).eq("id", existing["id"]).execute()
         return jsonify({"ok": True, "project": (saved.data or [existing])[0], "updated_existing": True})
@@ -725,46 +677,6 @@ def api_list_projects():
     resp = sb.table("projects").select("*").eq("owner_id", owner_id).order("created_at", desc=True).execute()
     return jsonify({"ok": True, "projects": resp.data or []})
 
-@app.patch("/projects/<project_id>")
-def api_update_project(project_id):
-    sb = get_supabase()
-    body = request.get_json(force=True) or {}
-
-    user_id = (body.get("user_id") or "").strip()
-    if not user_id:
-        return jsonify({"ok": False, "error": "user_id required"}), 400
-
-    project = get_project(sb, project_id)
-    if not project:
-        return jsonify({"ok": False, "error": "Project not found"}), 404
-    if str(project.get("owner_id")) != user_id:
-        return jsonify({"ok": False, "error": "Forbidden"}), 403
-
-    update: Dict[str, Any] = {}
-    if "name" in body:
-        update["name"] = (body.get("name") or "").strip()
-    if "url" in body:
-        update["url"] = (body.get("url") or "").strip()
-    if "niche" in body:
-        update["niche"] = (body.get("niche") or "").strip() or None
-    if "keywords" in body:
-        update["keywords"] = _clean_list(body.get("keywords"))
-    if "locations" in body:
-        update["locations"] = _clean_list(body.get("locations"))
-    if "auto_mode" in body:
-        update["auto_mode"] = bool(body.get("auto_mode"))
-    if "auto_daily_cap" in body:
-        update["auto_daily_cap"] = _safe_int(body.get("auto_daily_cap"), AUTO_DAILY_CAP_DEFAULT)
-    if "sources" in body:
-        update["sources"] = _clean_list(body.get("sources"))
-
-    update = {k: v for k, v in update.items() if not (k in ["name", "url"] and not v)}
-    if not update:
-        return jsonify({"ok": False, "error": "No valid fields to update"}), 400
-
-    saved = sb.table("projects").update(update).eq("id", project_id).execute()
-    return jsonify({"ok": True, "project": (saved.data or [project])[0]})
-
 @app.patch("/projects/<project_id>/auto")
 def api_toggle_auto(project_id):
     sb = get_supabase()
@@ -791,24 +703,6 @@ def api_toggle_auto(project_id):
     }).eq("id", project_id).execute()
 
     return jsonify({"ok": True, "project": (saved.data or [project])[0]})
-
-
-@app.delete("/projects/<project_id>")
-def api_delete_project(project_id):
-    sb = get_supabase()
-    body = request.get_json(force=True) or {}
-    user_id = (body.get("user_id") or "").strip()
-    if not user_id:
-        return jsonify({"ok": False, "error": "user_id required"}), 400
-
-    project = get_project(sb, project_id)
-    if not project:
-        return jsonify({"ok": False, "error": "Project not found"}), 404
-    if str(project.get("owner_id")) != user_id:
-        return jsonify({"ok": False, "error": "Forbidden"}), 403
-
-    sb.table("projects").delete().eq("id", project_id).execute()
-    return jsonify({"ok": True, "deleted": True, "project_id": project_id})
 
 
 # --- Manual scan ---
@@ -854,6 +748,78 @@ def api_list_leads():
     leads = list_leads(sb, project_id=project_id, limit=limit, status=status)
     return jsonify({"ok": True, "leads": leads})
 
+@app.patch("/leads/<lead_id>/status")
+def api_update_lead_status(lead_id):
+    sb = get_supabase()
+    body = request.get_json(force=True) or {}
+
+    user_id = (body.get("user_id") or "").strip()
+    status = _clean_status(body.get("status") or "")
+
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id required"}), 400
+    if status not in ALLOWED_LEAD_STATUSES:
+        return jsonify({"ok": False, "error": f"Invalid status. Allowed: {sorted(list(ALLOWED_LEAD_STATUSES))}"}), 400
+
+    resp = sb.table("leads").select("*").eq("id", lead_id).limit(1).execute()
+    rows = resp.data or []
+    if not rows:
+        return jsonify({"ok": False, "error": "Lead not found"}), 404
+
+    lead = rows[0]
+    project_id = lead.get("project_id")
+    if not project_id:
+        return jsonify({"ok": False, "error": "Lead missing project_id"}), 400
+
+    proj = get_project(sb, project_id)
+    if not proj:
+        return jsonify({"ok": False, "error": "Project not found"}), 404
+    if str(proj.get("owner_id")) != user_id:
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    saved = sb.table("leads").update({
+        "status": status,
+        "updated_at": now_iso(),
+    }).eq("id", lead_id).execute()
+
+    out = (saved.data or [lead])[0]
+    return jsonify({"ok": True, "lead": out})
+
+@app.post("/leads/<lead_id>/note")
+def api_set_lead_note(lead_id):
+    sb = get_supabase()
+    body = request.get_json(force=True) or {}
+
+    user_id = (body.get("user_id") or "").strip()
+    note = (body.get("note") or "").strip()
+
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id required"}), 400
+
+    resp = sb.table("leads").select("*").eq("id", lead_id).limit(1).execute()
+    rows = resp.data or []
+    if not rows:
+        return jsonify({"ok": False, "error": "Lead not found"}), 404
+
+    lead = rows[0]
+    project_id = lead.get("project_id")
+    if not project_id:
+        return jsonify({"ok": False, "error": "Lead missing project_id"}), 400
+
+    proj = get_project(sb, project_id)
+    if not proj:
+        return jsonify({"ok": False, "error": "Project not found"}), 404
+    if str(proj.get("owner_id")) != user_id:
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    saved = sb.table("leads").update({
+        "note": note[:5000],
+        "updated_at": now_iso(),
+    }).eq("id", lead_id).execute()
+
+    out = (saved.data or [lead])[0]
+    return jsonify({"ok": True, "lead": out})
+
 @app.post("/leads/<lead_id>/analyze")
 def api_analyze_lead(lead_id):
     sb = get_supabase()
@@ -890,6 +856,7 @@ def api_analyze_lead(lead_id):
         "analysis": analysis,
         "status": new_status,
         "last_analyzed_at": now_iso(),
+        "updated_at": now_iso(),
     }).eq("id", lead_id).execute()
 
     return jsonify({"ok": True, "lead_id": lead_id, "analysis": analysis, "status": new_status})
@@ -929,9 +896,6 @@ def api_audit_project(project_id):
     return jsonify({"ok": True, "project_id": project_id, "audit": audit})
 
 
-# -----------------------------
-# Main
-# -----------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
