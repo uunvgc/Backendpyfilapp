@@ -326,3 +326,31 @@ if FIILTHY_WORKER_ENABLED and sb is not None:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+import time
+
+def process_queue():
+    while True:
+        try:
+            jobs = sb.table("actions_queue") \
+                .select("*") \
+                .eq("status", "pending") \
+                .limit(5) \
+                .execute()
+
+            for job in jobs.data:
+                print("Processing:", job["id"])
+
+                # Example action
+                if job["type"] == "ping":
+                    print("Ping received")
+
+                # Mark done
+                sb.table("actions_queue") \
+                    .update({"status": "done"}) \
+                    .eq("id", job["id"]) \
+                    .execute()
+
+        except Exception as e:
+            print("Worker error:", e)
+
+        time.sleep(5)
