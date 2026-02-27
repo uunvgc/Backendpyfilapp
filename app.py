@@ -1,3 +1,21 @@
+# app.py — FIILTHY backend (Flask)
+# Includes: Projects, Leads (pipeline+notes), Multi-source scanning, Job Queue API
+# IMPORTANT: This version includes the DEDUPE FIX and SAFE UPSERT (project_id + url).
+#
+# Required ENV:
+#   SUPABASE_URL
+#   SUPABASE_KEY
+#
+# Optional:
+#   FIILTHY_API_KEY
+#   SERPAPI_KEY or SERPER_API_KEY
+#
+# Run locally:
+#   python app.py
+#
+# Deploy (Render):
+#   gunicorn app:app
+
 import os
 import time
 import random
@@ -192,17 +210,6 @@ def project_sources(project: dict) -> List[str]:
         return [str(x).strip() for x in s if str(x).strip()]
     return DEFAULT_SOURCES
 
-def insert_lead(sb, row: dict) -> Optional[dict]:
-    """
-    NOTE: This currently upserts on url only.
-    Best practice is on_conflict="project_id,url" with a unique constraint.
-    """
-    if not row.get("url"):
-        return None
-    resp = sb.table("leads").upsert(row, on_conflict="url").execute()
-    data = resp.data or []
-    return data[0] if data else row
-
 def list_leads(sb, project_id: Optional[str], limit: int, status: Optional[str]) -> List[dict]:
     q = sb.table("leads").select("*").order("created_at", desc=True).limit(limit)
     if project_id:
@@ -212,21 +219,59 @@ def list_leads(sb, project_id: Optional[str], limit: int, status: Optional[str])
     resp = q.execute()
     return resp.data or []
 
-def latest_positioning(sb, project_id: str) -> dict:
-    # If you have a site_audits table with positioning, return latest positioning
-    # Safe if table doesn't exist: will throw; you can remove if not using audits yet.
-    resp = (
-        sb.table("site_audits")
-        .select("positioning")
+# -----------------------------
+# DEDUPE FIX + SAFE UPSERT
+# -----------------------------
+def insert_lead(sb, row: dict) -> Optional[dict]:
+    """
+    Smart upsert:
+    - Unique per (project_id, url)
+    - Preserves manual fields (status, note, drafts)
+    - Improves score if better
+    - Merges reasons
+    Requires unique index/constraint on (project_id, url).
+    """
+    project_id = row.get("project_id")
+    url = row.get("url")
+    if not project_id or not url:
+        return None
+
+    existing_resp = (
+        sb.table("leads")
+        .select("*")
         .eq("project_id", project_id)
-        .order("fetched_at", desc=True)
+        .eq("url", url)
         .limit(1)
         .execute()
     )
-    rows = resp.data or []
-    if not rows:
-        return {}
-    return rows[0].get("positioning") or {}
+    existing_rows = existing_resp.data or []
+
+    if not existing_rows:
+        row["status"] = row.get("status") or "new"
+        row["created_at"] = row.get("created_at") or now_iso()
+        resp = sb.table("leads").insert(row).execute()
+        data = resp.data or []
+        return data[0] if data else row
+
+    existing = existing_rows[0]
+
+    new_score = int(row.get("score") or 0)
+    old_score = int(existing.get("score") or 0)
+
+    merged_reasons = list(set((existing.get("reasons") or []) + (row.get("reasons") or [])))
+
+    update = {
+        "content": row.get("content") or existing.get("content"),
+        "reasons": merged_reasons,
+        "updated_at": now_iso(),
+    }
+
+    if new_score > old_score:
+        update["score"] = new_score
+
+    resp = sb.table("leads").update(update).eq("id", existing["id"]).execute()
+    data = resp.data or []
+    return data[0] if data else existing
 
 
 # -----------------------------
@@ -250,7 +295,6 @@ def fetch_from_sources(query: str, project: dict, per_source: int) -> List[Dict[
         out.extend(fetch_hn(query, limit=per_source, timeout=HTTP_TIMEOUT))
 
     if "indiehackers" in sources:
-        # RSS is not query-based; filter by keywords
         kws = []
         kws.extend(_clean_list(project.get("keywords")))
         if project.get("niche"):
@@ -260,7 +304,6 @@ def fetch_from_sources(query: str, project: dict, per_source: int) -> List[Dict[
                 kws.append(tok)
         out.extend(fetch_indiehackers_rss(kws, limit=per_source, timeout=HTTP_TIMEOUT))
 
-    # Deduplicate within batch by deep_link/url
     seen = set()
     deduped: List[Dict[str, str]] = []
     for r in out:
@@ -344,7 +387,7 @@ def run_project_scan(
                 if saved:
                     inserted += 1
 
-                    # Optional notify (safe)
+                    # Optional notify
                     try:
                         maybe_alert_hot_lead(
                             sb,
@@ -510,7 +553,7 @@ def api_update_project(project_id):
     return jsonify({"ok": True, "project": (saved.data or [proj])[0]})
 
 
-# -------- Scan / Audit / Analyze (enqueue jobs) --------
+# -------- Scan (enqueue job) --------
 @app.post("/projects/<project_id>/scan")
 def api_scan_project(project_id):
     sb = get_supabase()
@@ -527,7 +570,6 @@ def api_scan_project(project_id):
     if str(proj.get("owner_id")) != user_id:
         return jsonify({"ok": False, "error": "Forbidden"}), 403
 
-    # If serp is enabled but no key exists, fail early (optional)
     if "serp" in project_sources(proj) and (not SERPAPI_KEY and not SERPER_API_KEY):
         return jsonify({"ok": False, "error": "SERP enabled but no SERP provider configured (SERPAPI_KEY or SERPER_API_KEY)."}), 500
 
@@ -543,76 +585,6 @@ def api_scan_project(project_id):
         },
         priority=_safe_int(body.get("priority"), 50),
         max_attempts=_safe_int(body.get("max_attempts"), 5),
-    )
-    return jsonify({"ok": True, "queued": True, "job": job})
-
-@app.post("/projects/<project_id>/audit")
-def api_audit_project(project_id):
-    """
-    Queues an audit job. Worker will run it (audit_site).
-    """
-    sb = get_supabase()
-    body = request.get_json(force=True) or {}
-
-    user_id = (body.get("user_id") or "").strip()
-    user_email = (body.get("user_email") or "").strip()
-    if not user_id or not user_email:
-        return jsonify({"ok": False, "error": "user_id and user_email required"}), 400
-
-    proj = get_project(sb, project_id)
-    if not proj:
-        return jsonify({"ok": False, "error": "Project not found"}), 404
-    if str(proj.get("owner_id")) != user_id:
-        return jsonify({"ok": False, "error": "Forbidden"}), 403
-
-    target_url = (body.get("target_url") or proj.get("url") or "").strip()
-    if not target_url:
-        return jsonify({"ok": False, "error": "No target_url and project has no url"}), 400
-
-    job = enqueue_job(
-        sb,
-        owner_id=user_id,
-        project_id=project_id,
-        job_type="audit_project",
-        payload={"url": target_url},
-        priority=_safe_int(body.get("priority"), 80),
-        max_attempts=_safe_int(body.get("max_attempts"), 3),
-    )
-    return jsonify({"ok": True, "queued": True, "job": job})
-
-@app.post("/leads/<lead_id>/analyze")
-def api_analyze_lead(lead_id):
-    """
-    Queues analysis job (worker will run analyze_lead + update lead).
-    """
-    sb = get_supabase()
-    body = request.get_json(force=True) or {}
-
-    user_id = (body.get("user_id") or "").strip()
-    if not user_id:
-        return jsonify({"ok": False, "error": "user_id required"}), 400
-
-    resp = sb.table("leads").select("*").eq("id", lead_id).limit(1).execute()
-    rows = resp.data or []
-    if not rows:
-        return jsonify({"ok": False, "error": "Lead not found"}), 404
-
-    lead = rows[0]
-    project_id = lead.get("project_id")
-    proj = get_project(sb, project_id) if project_id else None
-    if not proj:
-        return jsonify({"ok": False, "error": "Project not found"}), 404
-    if str(proj.get("owner_id")) != user_id:
-        return jsonify({"ok": False, "error": "Forbidden"}), 403
-
-    job = enqueue_job(
-        sb,
-        owner_id=user_id,
-        project_id=project_id,
-        job_type="analyze_lead",
-        payload={"lead_id": lead_id},
-        priority=_safe_int(body.get("priority"), 70),
-        max_attempts=_safe_int(body.get("max_attempts"), 3),
     )
     return jsonify({"ok": True, "queued": True, "job": job})
 
