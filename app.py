@@ -1,21 +1,3 @@
-# app.py — FIILTHY backend (Flask)
-# Includes: Projects, Leads (pipeline+notes), Multi-source scanning, Job Queue API
-# IMPORTANT: This version includes the DEDUPE FIX and SAFE UPSERT (project_id + url).
-#
-# Required ENV:
-#   SUPABASE_URL
-#   SUPABASE_KEY
-#
-# Optional:
-#   FIILTHY_API_KEY
-#   SERPAPI_KEY or SERPER_API_KEY
-#
-# Run locally:
-#   python app.py
-#
-# Deploy (Render):
-#   gunicorn app:app
-
 import os
 import time
 import random
@@ -30,7 +12,6 @@ try:
 except Exception:
     create_client = None
 
-# Your logic modules
 from logic.query_builder import build_queries, CompanyProfile
 from logic.scoring import score_lead
 from logic.cache import filter_queries, mark_query_run
@@ -123,9 +104,6 @@ def _clean_list(val) -> List[str]:
         return [x.strip() for x in val.split(",") if x.strip()]
     return [str(val).strip()] if str(val).strip() else []
 
-def _sleep_jitter(a=0.2, b=1.0):
-    time.sleep(random.uniform(a, b))
-
 def _clean_status(s: str) -> str:
     return (s or "").strip().lower()
 
@@ -134,10 +112,6 @@ def _clean_status(s: str) -> str:
 # SERP (Google) Fetcher
 # -----------------------------
 def fetch_serp_results(query: str, per_query: int) -> List[Dict[str, str]]:
-    """
-    Returns normalized:
-      {title,url,deep_link,snippet,source}
-    """
     per_query = max(1, min(100, int(per_query)))
 
     if SERPAPI_KEY:
@@ -158,13 +132,7 @@ def fetch_serp_results(query: str, per_query: int) -> List[Dict[str, str]]:
             url = (res.get("link") or "").strip()
             snippet = (res.get("snippet") or "").strip()
             if title and url:
-                out.append({
-                    "title": title,
-                    "url": url,
-                    "deep_link": url,
-                    "snippet": snippet,
-                    "source": "serp/google",
-                })
+                out.append({"title": title, "url": url, "deep_link": url, "snippet": snippet, "source": "serp/google"})
         return out
 
     if SERPER_API_KEY:
@@ -179,13 +147,7 @@ def fetch_serp_results(query: str, per_query: int) -> List[Dict[str, str]]:
             url = (res.get("link") or "").strip()
             snippet = (res.get("snippet") or "").strip()
             if title and url:
-                out.append({
-                    "title": title,
-                    "url": url,
-                    "deep_link": url,
-                    "snippet": snippet,
-                    "source": "serp/google",
-                })
+                out.append({"title": title, "url": url, "deep_link": url, "snippet": snippet, "source": "serp/google"})
         return out
 
     return []
@@ -219,17 +181,33 @@ def list_leads(sb, project_id: Optional[str], limit: int, status: Optional[str])
     resp = q.execute()
     return resp.data or []
 
+def latest_positioning(sb, project_id: str) -> dict:
+    # Optional: if you have site_audits table. If not, return {}.
+    try:
+        resp = (
+            sb.table("site_audits")
+            .select("positioning")
+            .eq("project_id", project_id)
+            .order("fetched_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        return (rows[0].get("positioning") or {}) if rows else {}
+    except Exception:
+        return {}
+
+
 # -----------------------------
-# DEDUPE FIX + SAFE UPSERT
+# DEDUPE FIX + SAFE UPSERT + RESURFACING
 # -----------------------------
 def insert_lead(sb, row: dict) -> Optional[dict]:
     """
-    Smart upsert:
-    - Unique per (project_id, url)
-    - Preserves manual fields (status, note, drafts)
+    - Unique per (project_id, url) (DB index required)
+    - Preserves manual fields (status, note, user edits)
     - Improves score if better
     - Merges reasons
-    Requires unique index/constraint on (project_id, url).
+    - Tracks first_seen / last_seen / seen_count
     """
     project_id = row.get("project_id")
     url = row.get("url")
@@ -249,6 +227,9 @@ def insert_lead(sb, row: dict) -> Optional[dict]:
     if not existing_rows:
         row["status"] = row.get("status") or "new"
         row["created_at"] = row.get("created_at") or now_iso()
+        row["first_seen"] = row.get("first_seen") or now_iso()
+        row["last_seen"] = row.get("last_seen") or now_iso()
+        row["seen_count"] = int(row.get("seen_count") or 1)
         resp = sb.table("leads").insert(row).execute()
         data = resp.data or []
         return data[0] if data else row
@@ -257,15 +238,15 @@ def insert_lead(sb, row: dict) -> Optional[dict]:
 
     new_score = int(row.get("score") or 0)
     old_score = int(existing.get("score") or 0)
-
     merged_reasons = list(set((existing.get("reasons") or []) + (row.get("reasons") or [])))
 
     update = {
         "content": row.get("content") or existing.get("content"),
         "reasons": merged_reasons,
         "updated_at": now_iso(),
+        "last_seen": now_iso(),
+        "seen_count": int(existing.get("seen_count") or 1) + 1,
     }
-
     if new_score > old_score:
         update["score"] = new_score
 
@@ -278,10 +259,6 @@ def insert_lead(sb, row: dict) -> Optional[dict]:
 # Source fetching
 # -----------------------------
 def fetch_from_sources(query: str, project: dict, per_source: int) -> List[Dict[str, str]]:
-    """
-    Normalized results:
-      {title,url,deep_link,snippet,source}
-    """
     sources = project_sources(project)
     out: List[Dict[str, str]] = []
 
@@ -304,6 +281,7 @@ def fetch_from_sources(query: str, project: dict, per_source: int) -> List[Dict[
                 kws.append(tok)
         out.extend(fetch_indiehackers_rss(kws, limit=per_source, timeout=HTTP_TIMEOUT))
 
+    # batch dedupe
     seen = set()
     deduped: List[Dict[str, str]] = []
     for r in out:
@@ -328,11 +306,8 @@ def run_project_scan(
     max_queries: int = MAX_QUERIES_PER_SCAN,
     per_source: int = PER_SOURCE_RESULTS,
 ) -> Dict[str, Any]:
-    """
-    Build queries -> cache filter -> fetch sources -> score -> store leads.
-    Heavy AI analysis happens via jobs (analyze_lead).
-    """
     project_id = project.get("id")
+
     profile = CompanyProfile(
         url=project.get("url") or "",
         name=project.get("name"),
@@ -357,7 +332,6 @@ def run_project_scan(
                 deep_link = (res.get("deep_link") or res.get("url") or "").strip()
                 snippet = (res.get("snippet") or "").strip()
                 source = (res.get("source") or "unknown").strip()
-
                 if not title or not deep_link:
                     continue
 
@@ -386,8 +360,6 @@ def run_project_scan(
                 saved = insert_lead(sb, lead_row)
                 if saved:
                     inserted += 1
-
-                    # Optional notify
                     try:
                         maybe_alert_hot_lead(
                             sb,
@@ -475,6 +447,7 @@ def api_create_project():
         return jsonify({"ok": False, "error": "url required"}), 400
 
     existing = find_project_by_owner_url(sb, owner_id, url)
+
     update = {
         "name": name,
         "niche": (body.get("niche") or "").strip() or None,
@@ -626,11 +599,7 @@ def api_update_lead_status(lead_id):
     if str(proj.get("owner_id")) != user_id:
         return jsonify({"ok": False, "error": "Forbidden"}), 403
 
-    saved = sb.table("leads").update({
-        "status": status,
-        "updated_at": now_iso(),
-    }).eq("id", lead_id).execute()
-
+    saved = sb.table("leads").update({"status": status, "updated_at": now_iso()}).eq("id", lead_id).execute()
     out = (saved.data or [lead])[0]
     return jsonify({"ok": True, "lead": out})
 
@@ -658,13 +627,40 @@ def api_set_lead_note(lead_id):
     if str(proj.get("owner_id")) != user_id:
         return jsonify({"ok": False, "error": "Forbidden"}), 403
 
-    saved = sb.table("leads").update({
-        "note": note[:5000],
-        "updated_at": now_iso(),
-    }).eq("id", lead_id).execute()
-
+    saved = sb.table("leads").update({"note": note[:5000], "updated_at": now_iso()}).eq("id", lead_id).execute()
     out = (saved.data or [lead])[0]
     return jsonify({"ok": True, "lead": out})
+
+@app.post("/leads/<lead_id>/draft")
+def api_draft_reply(lead_id):
+    sb = get_supabase()
+    body = request.get_json(force=True) or {}
+
+    user_id = (body.get("user_id") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id required"}), 400
+
+    resp = sb.table("leads").select("*").eq("id", lead_id).limit(1).execute()
+    rows = resp.data or []
+    if not rows:
+        return jsonify({"ok": False, "error": "Lead not found"}), 404
+
+    lead = rows[0]
+    project_id = lead.get("project_id")
+    proj = get_project(sb, project_id) if project_id else None
+    if not proj or str(proj.get("owner_id")) != user_id:
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    job = enqueue_job(
+        sb,
+        owner_id=user_id,
+        project_id=project_id,
+        job_type="draft_reply",
+        payload={"lead_id": lead_id},
+        priority=_safe_int(body.get("priority"), 60),
+        max_attempts=_safe_int(body.get("max_attempts"), 3),
+    )
+    return jsonify({"ok": True, "queued": True, "job": job})
 
 
 # -------- Jobs --------
@@ -745,6 +741,53 @@ def api_cancel_job(job_id):
     if not ok:
         return jsonify({"ok": False, "error": "Cannot cancel (not found / forbidden / already finished)"}), 400
     return jsonify({"ok": True, "cancelled": True, "job_id": job_id})
+
+
+@app.get("/metrics")
+def api_metrics():
+    sb = get_supabase()
+    user_id = (request.args.get("user_id") or "").strip()
+    project_id = (request.args.get("project_id") or "").strip() or None
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id required"}), 400
+
+    if project_id:
+        proj = get_project(sb, project_id)
+        if not proj:
+            return jsonify({"ok": False, "error": "Project not found"}), 404
+        if str(proj.get("owner_id")) != user_id:
+            return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    leads_all = sb.table("leads").select("id", count="exact")
+    if project_id:
+        leads_all = leads_all.eq("project_id", project_id)
+    total = getattr(leads_all.execute(), "count", 0) or 0
+
+    src_q = sb.table("leads").select("source")
+    if project_id:
+        src_q = src_q.eq("project_id", project_id)
+    src_rows = (src_q.execute().data or [])
+    by_source = {}
+    for r in src_rows:
+        s = (r.get("source") or "unknown")
+        by_source[s] = by_source.get(s, 0) + 1
+
+    jobs_q = sb.table("jobs").select("status")
+    if project_id:
+        jobs_q = jobs_q.eq("project_id", project_id)
+    job_rows = jobs_q.execute().data or []
+    by_job_status = {}
+    for r in job_rows:
+        st = r.get("status") or "unknown"
+        by_job_status[st] = by_job_status.get(st, 0) + 1
+
+    return jsonify({
+        "ok": True,
+        "project_id": project_id,
+        "leads_total": total,
+        "leads_by_source": by_source,
+        "jobs_by_status": by_job_status,
+    })
 
 
 # -----------------------------
