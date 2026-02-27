@@ -1,4 +1,46 @@
-.    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+# app.py (Render-friendly single file)
+# - Flask API + Supabase
+# - Background worker thread (enabled with WORKER=1)
+# - Queue table: actions_queue
+# - Example action: enrich_lead (calls OpenAI) / scan_target (placeholder)
+
+import os
+import time
+import json
+import threading
+from datetime import datetime, timezone, timedelta
+
+import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from supabase import create_client
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+FIILTHY_USER_AGENT = os.getenv("FIILTHY_USER_AGENT", "fiilthy-backend/1.0")
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+# IMPORTANT: backend should use SERVICE ROLE key (not anon)
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+WORKER_ENABLED = os.getenv("WORKER", "0") == "1"  # set WORKER=1 on Render to enable
+WORKER_POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
+LOCK_TTL_SECONDS = int(os.getenv("LOCK_TTL_SECONDS", "600"))  # 10 minutes
+
+# -----------------------------
+# APP INIT
+# -----------------------------
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+sb = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 _worker_started = False
 _worker_last_tick = None
@@ -8,7 +50,7 @@ _worker_last_error = None
 # -----------------------------
 # HELPERS
 # -----------------------------
-def utcnow():
+def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -34,11 +76,14 @@ def openai_chat_json(system: str, user: str, schema_hint: str = "") -> dict:
         "User-Agent": FIILTHY_USER_AGENT,
     }
     payload = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        "model": OPENAI_MODEL,
         "temperature": 0.2,
         "messages": [
             {"role": "system", "content": system.strip()},
-            {"role": "user", "content": (user.strip() + ("\n\n" + schema_hint.strip() if schema_hint else "")).strip()},
+            {
+                "role": "user",
+                "content": (user.strip() + ("\n\n" + schema_hint.strip() if schema_hint else "")).strip(),
+            },
         ],
     }
 
@@ -47,13 +92,15 @@ def openai_chat_json(system: str, user: str, schema_hint: str = "") -> dict:
     data = r.json()
 
     text = (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
-    # Try parse JSON from the response (best effort)
     parsed = _safe_json_loads(text)
     if isinstance(parsed, dict):
         return parsed
 
-    # If model returned prose, wrap it
     return {"text": text}
+
+
+def supabase_ok():
+    return sb is not None
 
 
 # -----------------------------
@@ -64,7 +111,7 @@ def health():
     return jsonify(
         {
             "ok": True,
-            "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
+            "supabase_configured": supabase_ok(),
             "worker_enabled": WORKER_ENABLED,
         }
     )
@@ -75,9 +122,12 @@ def envcheck():
     return jsonify(
         {
             "SUPABASE_URL_set": bool(SUPABASE_URL),
-            "SUPABASE_KEY_set": bool(SUPABASE_KEY),
+            "SUPABASE_SERVICE_ROLE_KEY_set": bool(SUPABASE_SERVICE_ROLE_KEY),
             "OPENAI_API_KEY_set": bool(OPENAI_API_KEY),
             "WORKER": os.getenv("WORKER", None),
+            "POLL_SECONDS": os.getenv("POLL_SECONDS", None),
+            "LOCK_TTL_SECONDS": os.getenv("LOCK_TTL_SECONDS", None),
+            "OPENAI_MODEL": OPENAI_MODEL,
         }
     )
 
@@ -106,7 +156,7 @@ def enqueue_action():
       "payload": { ...anything... }
     }
     """
-    if sb is None:
+    if not supabase_ok():
         return jsonify({"error": "Supabase not configured"}), 500
 
     body = request.get_json(force=True, silent=True) or {}
@@ -133,7 +183,7 @@ def run_worker_once():
     """
     Manual trigger for debugging (no need to wait for the thread).
     """
-    if sb is None:
+    if not supabase_ok():
         return jsonify({"error": "Supabase not configured"}), 500
     result = process_actions_queue_once()
     return jsonify({"ok": True, "result": result})
@@ -145,7 +195,7 @@ def leads():
     Example leads endpoint (adjust to your schema):
       /leads?project_id=...&limit=50&status=new&min_score=0.4
     """
-    if sb is None:
+    if not supabase_ok():
         return jsonify({"error": "Supabase not configured"}), 500
 
     project_id = (request.args.get("project_id") or "").strip()
@@ -176,18 +226,15 @@ def leads():
 # -----------------------------
 def claim_one_pending_action():
     """
-    Single-worker friendly claim:
-    - Find one pending action where lock is free/expired
-    - Lock it (set locked_at/locked_by/status)
-    NOTE: If you later scale to multiple workers, switch to a SQL RPC function for atomic claim.
+    Single-worker friendly claim.
+    NOTE: For true multi-worker atomic claims, use a Postgres function/RPC.
     """
     now = utcnow()
     lock_expired_before = (now - timedelta(seconds=LOCK_TTL_SECONDS)).isoformat()
 
-    # find one claimable row
-    # claimable if:
-    #   status = 'pending' OR (status='working' and locked_at older than TTL)
-    # We keep it simple: prefer pending first.
+    # Get oldest claimable action:
+    # - pending
+    # - OR working but lock expired
     res = (
         sb.table("actions_queue")
         .select("*")
@@ -204,7 +251,6 @@ def claim_one_pending_action():
     row = rows[0]
     action_id = row["id"]
 
-    # lock it (optimistic: only lock if still claimable)
     locked_by = os.getenv("RENDER_SERVICE_NAME", "render-web")
     upd = (
         sb.table("actions_queue")
@@ -217,14 +263,13 @@ def claim_one_pending_action():
             }
         )
         .eq("id", action_id)
-        .in_("status", ["pending", "working"])  # allow re-claim of expired working
+        .in_("status", ["pending", "working"])
         .execute()
     )
 
     if not upd.data:
         return None
 
-    # return latest row state
     return upd.data[0]
 
 
@@ -238,7 +283,9 @@ def mark_action_done(action_id: str, result: dict | None = None):
 
 def mark_action_error(action_id: str, err: str):
     now = utcnow().isoformat()
-    sb.table("actions_queue").update({"status": "error", "done_at": now, "error": err[:4000]}).eq("id", action_id).execute()
+    sb.table("actions_queue").update(
+        {"status": "error", "done_at": now, "error": err[:4000]}
+    ).eq("id", action_id).execute()
 
 
 def handle_action(row: dict) -> dict:
@@ -256,13 +303,11 @@ def handle_action(row: dict) -> dict:
         if not lead_id:
             return {"skipped": True, "reason": "payload.lead_id missing"}
 
-        # Load lead
         lead_res = sb.table("leads").select("*").eq("id", lead_id).limit(1).execute()
         lead = (lead_res.data or [None])[0]
         if not lead:
             return {"skipped": True, "reason": f"lead not found: {lead_id}"}
 
-        # Ask OpenAI to score + draft reply (best effort JSON)
         system = "You are a lead qualification assistant for a SaaS that finds people asking for help online."
         user = f"""
 Lead:
@@ -272,7 +317,8 @@ source: {lead.get('source','')}
 permalink: {lead.get('permalink','')}
 
 Return JSON only.
-"""
+""".strip()
+
         schema_hint = """
 JSON schema:
 {
@@ -280,10 +326,10 @@ JSON schema:
   "reason": string,         // why it's a good lead
   "suggested_reply": string // short helpful reply (no spam)
 }
-"""
+""".strip()
+
         ai = openai_chat_json(system, user, schema_hint=schema_hint)
 
-        # Update lead with enrichment if fields exist in your schema
         update = {}
         if isinstance(ai, dict) and "score" in ai:
             try:
@@ -301,10 +347,10 @@ JSON schema:
         return {"lead_id": lead_id, "enriched": True, "ai": ai}
 
     if action_type == "scan_target":
-        # Placeholder: you can plug in your crawler/scanner here
         target_url = (payload.get("target_url") or "").strip()
         if not target_url:
             return {"skipped": True, "reason": "payload.target_url missing"}
+        # TODO: plug your crawler/scanner here
         return {"scanned": True, "target_url": target_url, "note": "scanner not implemented in this file"}
 
     return {"skipped": True, "reason": f"unknown action type: {action_type}"}
@@ -317,7 +363,7 @@ def process_actions_queue_once():
     """
     global _worker_last_error
 
-    if sb is None:
+    if not supabase_ok():
         return {"error": "Supabase not configured"}
 
     row = claim_one_pending_action()
@@ -338,6 +384,7 @@ def process_actions_queue_once():
 
 def worker_loop():
     global _worker_last_tick, _worker_last_error
+    print("✅ Worker loop running...")
     while True:
         try:
             _worker_last_tick = utcnow().isoformat()
@@ -345,6 +392,7 @@ def worker_loop():
             time.sleep(WORKER_POLL_SECONDS)
         except Exception as e:
             _worker_last_error = repr(e)
+            print("❌ Worker error:", _worker_last_error)
             time.sleep(5)
 
 
@@ -361,29 +409,11 @@ def start_worker_if_enabled():
     print("Worker thread started ✅")
 
 
-# Start the worker when the process boots (Render/Gunicorn loads this module)
+# Start worker when module loads (Render/Gunicorn imports this file)
 start_worker_if_enabled()
 
 
-# Optional: allow local run
+# Local run only
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=True) 
-import threading, os, time
-
-def worker_loop():
-    print("✅ Worker loop running...")
-    while True:
-        try:
-            # call your pick_jobs / process logic here
-            # process_batch()
-            pass
-        except Exception as e:
-            print("❌ Worker error:", e)
-        time.sleep(int(os.getenv("POLL_SECONDS", "15")))
-
-if os.getenv("RUN_WORKER", "0") == "1":
-    threading.Thread(target=worker_loop, daemon=True).start()
-
-host="0.0.0.0"
-port=int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=True)
