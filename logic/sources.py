@@ -13,6 +13,7 @@
 
 import time
 import random
+import re
 from datetime import datetime, timezone
 from typing import Dict, List
 from urllib.parse import quote_plus
@@ -41,6 +42,14 @@ def _find_first_text(node, tags: List[str]) -> str:
             return el.text
     return ""
 
+def _strip_html(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", s)
+    s = re.sub(r"(?is)<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 
 # -----------------------------
 # Reddit
@@ -55,15 +64,29 @@ def fetch_reddit(query: str, limit: int = 15, timeout: int = 20) -> List[Dict[st
     if not q:
         return []
 
-    url = f"https://www.reddit.com/search.json?q={quote_plus(q)}&sort=new&limit={int(limit)}"
+    # primary + fallback if rate-limited
+    urls = [
+        f"https://www.reddit.com/search.json?q={quote_plus(q)}&sort=new&limit={int(limit)}",
+        f"https://old.reddit.com/search.json?q={quote_plus(q)}&sort=new&limit={int(limit)}",
+    ]
+
     headers = {"User-Agent": _ua()}
     _sleep_jitter()
 
-    r = requests.get(url, headers=headers, timeout=timeout)
-    if r.status_code == 429:
+    data = None
+    last_status = None
+
+    for u in urls:
+        r = requests.get(u, headers=headers, timeout=timeout)
+        last_status = r.status_code
+        if r.status_code == 429:
+            continue
+        r.raise_for_status()
+        data = r.json()
+        break
+
+    if data is None:
         return []
-    r.raise_for_status()
-    data = r.json()
 
     out: List[Dict[str, str]] = []
     children = ((data.get("data") or {}).get("children") or [])
@@ -74,7 +97,6 @@ def fetch_reddit(query: str, limit: int = 15, timeout: int = 20) -> List[Dict[st
         permalink = (d.get("permalink") or "").strip()
         deep = ("https://www.reddit.com" + permalink) if permalink.startswith("/") else permalink
 
-        # user wants click -> exact place, so prefer deep link
         url_final = deep or _safe_text(d.get("url"), 2000)
 
         selftext = _safe_text(d.get("selftext"), 1200)
@@ -148,8 +170,6 @@ def fetch_hn(query: str, limit: int = 15, timeout: int = 20) -> List[Dict[str, s
         object_id = (h.get("objectID") or "").strip()
 
         hn_link = f"https://news.ycombinator.com/item?id={object_id}" if object_id else ""
-
-        # deep_link should be the actual thread
         deep = hn_link or story_url
         url_final = story_url or hn_link
 
@@ -219,7 +239,10 @@ def fetch_indiehackers_rss(
     for item in items[:300]:
         title = _safe_text(_find_first_text(item, ["title"]), 500)
         link = (_find_first_text(item, ["link"]) or "").strip()
-        desc = _safe_text(_find_first_text(item, ["description"]), 2000)
+
+        raw_desc = _find_first_text(item, ["description"]) or ""
+        desc = _strip_html(raw_desc)
+        desc = _safe_text(desc, 2000)
 
         blob = f"{title}\n{desc}".lower()
         if kw and not any(k in blob for k in kw):
