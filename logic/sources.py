@@ -13,6 +13,7 @@
 
 import time
 import random
+from datetime import datetime, timezone
 from typing import Dict, List
 from urllib.parse import quote_plus
 
@@ -33,12 +34,6 @@ def _safe_text(x, limit: int) -> str:
 def _sleep_jitter(min_s=0.2, max_s=1.0):
     time.sleep(random.uniform(min_s, max_s))
 
-def _text(node, tag: str) -> str:
-    el = node.find(tag)
-    if el is None or el.text is None:
-        return ""
-    return el.text
-
 def _find_first_text(node, tags: List[str]) -> str:
     for t in tags:
         el = node.find(t)
@@ -54,7 +49,7 @@ def fetch_reddit(query: str, limit: int = 15, timeout: int = 20) -> List[Dict[st
     """
     Uses public Reddit search endpoint.
     Returns list of:
-      {title, url, deep_link, snippet, source}
+      {title, url, deep_link, snippet, source, created_at_iso, meta}
     """
     q = query.strip()
     if not q:
@@ -79,7 +74,7 @@ def fetch_reddit(query: str, limit: int = 15, timeout: int = 20) -> List[Dict[st
         permalink = (d.get("permalink") or "").strip()
         deep = ("https://www.reddit.com" + permalink) if permalink.startswith("/") else permalink
 
-        # Some results have external URL; but user wants click -> exact place.
+        # user wants click -> exact place, so prefer deep link
         url_final = deep or _safe_text(d.get("url"), 2000)
 
         selftext = _safe_text(d.get("selftext"), 1200)
@@ -95,6 +90,14 @@ def fetch_reddit(query: str, limit: int = 15, timeout: int = 20) -> List[Dict[st
             snippet_parts.append(selftext)
         snippet = " — ".join(snippet_parts)[:1200]
 
+        created_utc = d.get("created_utc")
+        created_at_iso = ""
+        if created_utc:
+            try:
+                created_at_iso = datetime.fromtimestamp(float(created_utc), tz=timezone.utc).isoformat()
+            except Exception:
+                created_at_iso = ""
+
         if not title or not url_final:
             continue
 
@@ -104,6 +107,13 @@ def fetch_reddit(query: str, limit: int = 15, timeout: int = 20) -> List[Dict[st
             "deep_link": deep or url_final,
             "snippet": snippet,
             "source": "reddit",
+            "created_at_iso": created_at_iso,
+            "meta": {
+                "subreddit": subreddit,
+                "author": author,
+                "num_comments": d.get("num_comments"),
+                "score": d.get("score"),
+            }
         })
 
     return out
@@ -117,7 +127,7 @@ def fetch_hn(query: str, limit: int = 15, timeout: int = 20) -> List[Dict[str, s
     HN Algolia API:
     https://hn.algolia.com/api/v1/search_by_date?query=...&tags=story
     Returns:
-      {title, url, deep_link, snippet, source}
+      {title, url, deep_link, snippet, source, created_at_iso, meta}
     """
     q = query.strip()
     if not q:
@@ -139,7 +149,7 @@ def fetch_hn(query: str, limit: int = 15, timeout: int = 20) -> List[Dict[str, s
 
         hn_link = f"https://news.ycombinator.com/item?id={object_id}" if object_id else ""
 
-        # deep_link should be the actual thread (exact place)
+        # deep_link should be the actual thread
         deep = hn_link or story_url
         url_final = story_url or hn_link
 
@@ -159,6 +169,13 @@ def fetch_hn(query: str, limit: int = 15, timeout: int = 20) -> List[Dict[str, s
             "deep_link": deep,
             "snippet": snippet,
             "source": "hn",
+            "created_at_iso": (h.get("created_at") or "").strip(),
+            "meta": {
+                "author": h.get("author"),
+                "points": h.get("points"),
+                "num_comments": h.get("num_comments"),
+                "object_id": object_id,
+            }
         })
 
     return out
@@ -197,7 +214,6 @@ def fetch_indiehackers_rss(
     kw = [k.strip().lower() for k in (keywords or []) if k and k.strip()]
     out: List[Dict[str, str]] = []
 
-    # Namespace-safe item search
     items = root.findall(".//item")
 
     for item in items[:300]:
