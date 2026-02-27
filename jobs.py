@@ -270,4 +270,4 @@ def reap_stuck_jobs(
         }).eq("id", job["id"]).execute()
         requeued += 1
 
-    return {"stuck_found": len(stuck), "requeued": requeued, "cutoff": iso(cutoff)}
+    return {"stuck_found": len(stuck), "requeued": requeued, "cutoff": iso(cutoff)} 
