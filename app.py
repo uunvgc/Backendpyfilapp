@@ -1,356 +1,407 @@
-"""
-FIILTHY Backend (Flask) — full app.py
-
-What this includes:
-- Flask + CORS
-- Supabase client (SERVICE_ROLE key on server)
-- /health
-- /leads (list with filters)
-- /actions/enqueue (push a job into actions_queue)
-- /actions/worker/tick (manual tick endpoint for debugging)
-- Background worker loop (runs automatically on Render) that:
-  - locks next pending job (Postgres RPC)
-  - executes it
-  - marks done/failed (Postgres RPC)
-
-IMPORTANT (Supabase SQL you MUST run once):
-- Create RPC functions:
-  - public.dequeue_action(p_project_id uuid default null) returns public.actions_queue
-  - public.finish_action(p_id uuid, p_status text, p_error text default null)
-(If you already ran them, you're good.)
-"""
-
+# app.py
 import os
 import time
+import json
 import threading
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone, timedelta
 
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
 from supabase import create_client
 
 # -----------------------------
 # ENV
 # -----------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()  # SERVICE_ROLE on server (Render)
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()  # SERVICE_ROLE (backend only)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-FIILTHY_WORKER_ENABLED = os.getenv("FIILTHY_WORKER_ENABLED", "1").strip() == "1"
-FIILTHY_WORKER_LOCKED_BY = os.getenv("FIILTHY_WORKER_LOCKED_BY", "worker").strip()
+WORKER_ENABLED = os.getenv("WORKER", "0").strip() == "1"
+WORKER_POLL_SECONDS = int(os.getenv("WORKER_POLL_SECONDS", "3"))
+LOCK_TTL_SECONDS = int(os.getenv("LOCK_TTL_SECONDS", "120"))  # re-claim stuck jobs after this
 
-FIILTHY_WORKER_SLEEP_IDLE = float(os.getenv("FIILTHY_WORKER_SLEEP_IDLE", "2.0"))
-FIILTHY_WORKER_SLEEP_BUSY = float(os.getenv("FIILTHY_WORKER_SLEEP_BUSY", "0.2"))
-
-# optional: only work a specific project
-FIILTHY_WORKER_PROJECT_ID = os.getenv("FIILTHY_WORKER_PROJECT_ID", "").strip() or None
-
-# -----------------------------
-# Supabase
-# -----------------------------
-if not SUPABASE_URL or not SUPABASE_KEY:
-    # Don't crash on import; but endpoints will fail until env vars are set.
-    sb = None
-else:
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
+FIILTHY_USER_AGENT = os.getenv("FIILTHY_USER_AGENT", "fiilthy/1.0 (+https://fiilthy)")
 
 # -----------------------------
-# Flask app
+# INIT
 # -----------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def ok(data: Any = None, status: int = 200):
-    payload = {"ok": True}
-    if data is not None:
-        payload["data"] = data
-    return jsonify(payload), status
+if not SUPABASE_URL or not SUPABASE_KEY:
+    # Don’t crash at import-time; health/envcheck will show missing.
+    sb = None
+else:
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
-def err(message: str, status: int = 400, extra: Any = None):
-    payload = {"ok": False, "error": message}
-    if extra is not None:
-        payload["extra"] = extra
-    return jsonify(payload), status
-
-
-def require_supabase():
-    if sb is None:
-        return False, err(
-            "Supabase not configured. Set SUPABASE_URL and SUPABASE_KEY on the server.",
-            500,
-        )
-    return True, None
+_worker_started = False
+_worker_last_tick = None
+_worker_last_error = None
 
 
 # -----------------------------
-# Health
+# HELPERS
+# -----------------------------
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _safe_json_loads(s: str):
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def openai_chat_json(system: str, user: str, schema_hint: str = "") -> dict:
+    """
+    Minimal OpenAI call via HTTPS. Returns dict (best effort).
+    Requires OPENAI_API_KEY in env.
+    """
+    if not OPENAI_API_KEY:
+        return {"error": "OPENAI_API_KEY not set"}
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": FIILTHY_USER_AGENT,
+    }
+    payload = {
+        "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system.strip()},
+            {"role": "user", "content": (user.strip() + ("\n\n" + schema_hint.strip() if schema_hint else "")).strip()},
+        ],
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    text = (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
+    # Try parse JSON from the response (best effort)
+    parsed = _safe_json_loads(text)
+    if isinstance(parsed, dict):
+        return parsed
+
+    # If model returned prose, wrap it
+    return {"text": text}
+
+
+# -----------------------------
+# API ROUTES
 # -----------------------------
 @app.get("/health")
 def health():
-    return ok(
+    return jsonify(
         {
-            "service": "fiilthy-backend",
-            "worker_enabled": FIILTHY_WORKER_ENABLED,
-            "project_lock": FIILTHY_WORKER_PROJECT_ID,
+            "ok": True,
+            "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
+            "worker_enabled": WORKER_ENABLED,
         }
     )
 
 
-# -----------------------------
-# Leads API (basic list)
-# -----------------------------
-@app.get("/leads")
-def leads():
-    good, resp = require_supabase()
-    if not good:
-        return resp
-
-    project_id = request.args.get("project_id", "").strip()
-    if not project_id:
-        return err("project_id is required", 400)
-
-    limit = int(request.args.get("limit", "50"))
-    status = request.args.get("status", "").strip() or None
-    min_score = request.args.get("min_score", "").strip() or None
-
-    q = sb.table("leads").select("*").eq("project_id", project_id).order(
-        "created_at", desc=True
+@app.get("/envcheck")
+def envcheck():
+    return jsonify(
+        {
+            "SUPABASE_URL_set": bool(SUPABASE_URL),
+            "SUPABASE_KEY_set": bool(SUPABASE_KEY),
+            "OPENAI_API_KEY_set": bool(OPENAI_API_KEY),
+            "WORKER": os.getenv("WORKER", None),
+        }
     )
 
-    if status:
-        q = q.eq("status", status)
 
-    if min_score is not None:
-        try:
-            q = q.gte("score", float(min_score))
-        except Exception:
-            return err("min_score must be a number", 400)
-
-    if limit > 200:
-        limit = 200
-    q = q.limit(limit)
-
-    try:
-        res = q.execute()
-        return ok(res.data or [])
-    except Exception as e:
-        return err("Failed to fetch leads", 500, str(e))
+@app.get("/worker_status")
+def worker_status():
+    return jsonify(
+        {
+            "enabled": WORKER_ENABLED,
+            "started": _worker_started,
+            "last_tick_utc": _worker_last_tick,
+            "last_error": _worker_last_error,
+            "poll_seconds": WORKER_POLL_SECONDS,
+            "lock_ttl_seconds": LOCK_TTL_SECONDS,
+        }
+    )
 
 
-# -----------------------------
-# Actions Queue API
-# -----------------------------
-@app.post("/actions/enqueue")
-def actions_enqueue():
+@app.post("/queue/enqueue")
+def enqueue_action():
     """
-    Body JSON:
+    Body:
     {
-      "project_id": "<uuid>",
-      "type": "ping" | "enrich_lead" | ...,
-      "payload": {...},
-      "priority": 0,
-      "run_at": "2026-02-26T00:00:00Z" (optional)
+      "project_id": "...uuid...",
+      "type": "enrich_lead" | "scan_target" | "...",
+      "payload": { ...anything... }
     }
     """
-    good, resp = require_supabase()
-    if not good:
-        return resp
+    if sb is None:
+        return jsonify({"error": "Supabase not configured"}), 500
 
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(force=True, silent=True) or {}
     project_id = (body.get("project_id") or "").strip()
     action_type = (body.get("type") or "").strip()
-
-    if not project_id:
-        return err("project_id is required", 400)
-    if not action_type:
-        return err("type is required", 400)
-
     payload = body.get("payload") or {}
-    priority = int(body.get("priority") or 0)
-    run_at = body.get("run_at")  # optional
+
+    if not project_id or not action_type:
+        return jsonify({"error": "project_id and type are required"}), 400
 
     row = {
         "project_id": project_id,
         "type": action_type,
         "payload": payload,
-        "priority": priority,
+        "status": "pending",
     }
-    if run_at:
-        row["run_at"] = run_at
 
-    try:
-        res = sb.table("actions_queue").insert(row).execute()
-        return ok(res.data[0] if res.data else row, 201)
-    except Exception as e:
-        return err("Failed to enqueue action", 500, str(e))
+    res = sb.table("actions_queue").insert(row).execute()
+    return jsonify({"ok": True, "inserted": res.data})
 
 
-@app.get("/actions")
-def actions_list():
-    """Debug list recent actions."""
-    good, resp = require_supabase()
-    if not good:
-        return resp
+@app.post("/queue/run_once")
+def run_worker_once():
+    """
+    Manual trigger for debugging (no need to wait for the thread).
+    """
+    if sb is None:
+        return jsonify({"error": "Supabase not configured"}), 500
+    result = process_actions_queue_once()
+    return jsonify({"ok": True, "result": result})
 
-    project_id = request.args.get("project_id", "").strip()
+
+@app.get("/leads")
+def leads():
+    """
+    Example leads endpoint (adjust to your schema):
+      /leads?project_id=...&limit=50&status=new&min_score=0.4
+    """
+    if sb is None:
+        return jsonify({"error": "Supabase not configured"}), 500
+
+    project_id = (request.args.get("project_id") or "").strip()
+    if not project_id:
+        return jsonify({"error": "project_id is required"}), 400
+
     limit = int(request.args.get("limit", "50"))
-    if limit > 200:
-        limit = 200
+    status = request.args.get("status")
+    min_score = request.args.get("min_score")
 
-    q = sb.table("actions_queue").select("*").order("created_at", desc=True).limit(limit)
-    if project_id:
-        q = q.eq("project_id", project_id)
+    q = sb.table("leads").select("*").eq("project_id", project_id).limit(limit)
 
-    try:
-        res = q.execute()
-        return ok(res.data or [])
-    except Exception as e:
-        return err("Failed to list actions", 500, str(e))
+    if status:
+        q = q.eq("status", status)
+
+    if min_score is not None and str(min_score).strip() != "":
+        try:
+            q = q.gte("score", float(min_score))
+        except Exception:
+            return jsonify({"error": "min_score must be a number"}), 400
+
+    res = q.order("created_at", desc=True).execute()
+    return jsonify({"ok": True, "data": res.data})
 
 
 # -----------------------------
-# Worker (queue runner)
+# WORKER CORE
 # -----------------------------
-def execute_action(job: Dict[str, Any]) -> Dict[str, Any]:
+def claim_one_pending_action():
     """
-    Add your real automation types here.
-    job fields:
-      id, project_id, type, payload, status, priority, run_at, attempts, max_attempts...
+    Single-worker friendly claim:
+    - Find one pending action where lock is free/expired
+    - Lock it (set locked_at/locked_by/status)
+    NOTE: If you later scale to multiple workers, switch to a SQL RPC function for atomic claim.
     """
-    action_type = job.get("type")
-    payload = job.get("payload") or {}
+    now = utcnow()
+    lock_expired_before = (now - timedelta(seconds=LOCK_TTL_SECONDS)).isoformat()
 
-    # Example: quick smoke test
-    if action_type == "ping":
-        return {"ok": True, "message": "pong"}
+    # find one claimable row
+    # claimable if:
+    #   status = 'pending' OR (status='working' and locked_at older than TTL)
+    # We keep it simple: prefer pending first.
+    res = (
+        sb.table("actions_queue")
+        .select("*")
+        .or_(f"status.eq.pending,and(status.eq.working,locked_at.lt.{lock_expired_before})")
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
 
-    # Example: enrich lead (hook your existing code here)
+    rows = res.data or []
+    if not rows:
+        return None
+
+    row = rows[0]
+    action_id = row["id"]
+
+    # lock it (optimistic: only lock if still claimable)
+    locked_by = os.getenv("RENDER_SERVICE_NAME", "render-web")
+    upd = (
+        sb.table("actions_queue")
+        .update(
+            {
+                "status": "working",
+                "locked_at": now.isoformat(),
+                "locked_by": locked_by,
+                "error": None,
+            }
+        )
+        .eq("id", action_id)
+        .in_("status", ["pending", "working"])  # allow re-claim of expired working
+        .execute()
+    )
+
+    if not upd.data:
+        return None
+
+    # return latest row state
+    return upd.data[0]
+
+
+def mark_action_done(action_id: str, result: dict | None = None):
+    now = utcnow().isoformat()
+    payload = {"status": "done", "done_at": now, "error": None}
+    if result is not None:
+        payload["result"] = result
+    sb.table("actions_queue").update(payload).eq("id", action_id).execute()
+
+
+def mark_action_error(action_id: str, err: str):
+    now = utcnow().isoformat()
+    sb.table("actions_queue").update({"status": "error", "done_at": now, "error": err[:4000]}).eq("id", action_id).execute()
+
+
+def handle_action(row: dict) -> dict:
+    """
+    Implement your automation here.
+    Supported examples:
+      - enrich_lead: expects payload.lead_id
+      - scan_target: expects payload.target_url (placeholder)
+    """
+    action_type = row.get("type")
+    payload = row.get("payload") or {}
+
     if action_type == "enrich_lead":
-        lead_id = payload.get("lead_id")
+        lead_id = (payload.get("lead_id") or "").strip()
         if not lead_id:
-            raise ValueError("payload.lead_id is required for enrich_lead")
+            return {"skipped": True, "reason": "payload.lead_id missing"}
 
-        # TODO: your enrich logic (fetch lead -> enrich -> update lead)
-        # sb.table("leads").update({...}).eq("id", lead_id).execute()
-        return {"ok": True, "lead_id": lead_id, "enriched": True}
+        # Load lead
+        lead_res = sb.table("leads").select("*").eq("id", lead_id).limit(1).execute()
+        lead = (lead_res.data or [None])[0]
+        if not lead:
+            return {"skipped": True, "reason": f"lead not found: {lead_id}"}
 
-    raise ValueError(f"Unknown action type: {action_type}")
+        # Ask OpenAI to score + draft reply (best effort JSON)
+        system = "You are a lead qualification assistant for a SaaS that finds people asking for help online."
+        user = f"""
+Lead:
+title: {lead.get('title','')}
+content: {lead.get('content','')}
+source: {lead.get('source','')}
+permalink: {lead.get('permalink','')}
+
+Return JSON only.
+"""
+        schema_hint = """
+JSON schema:
+{
+  "score": number,          // 0..1
+  "reason": string,         // why it's a good lead
+  "suggested_reply": string // short helpful reply (no spam)
+}
+"""
+        ai = openai_chat_json(system, user, schema_hint=schema_hint)
+
+        # Update lead with enrichment if fields exist in your schema
+        update = {}
+        if isinstance(ai, dict) and "score" in ai:
+            try:
+                update["score"] = float(ai["score"])
+            except Exception:
+                pass
+        if isinstance(ai, dict) and "reason" in ai:
+            update["ai_reason"] = str(ai["reason"])[:4000]
+        if isinstance(ai, dict) and "suggested_reply" in ai:
+            update["suggested_reply"] = str(ai["suggested_reply"])[:4000]
+
+        if update:
+            sb.table("leads").update(update).eq("id", lead_id).execute()
+
+        return {"lead_id": lead_id, "enriched": True, "ai": ai}
+
+    if action_type == "scan_target":
+        # Placeholder: you can plug in your crawler/scanner here
+        target_url = (payload.get("target_url") or "").strip()
+        if not target_url:
+            return {"skipped": True, "reason": "payload.target_url missing"}
+        return {"scanned": True, "target_url": target_url, "note": "scanner not implemented in this file"}
+
+    return {"skipped": True, "reason": f"unknown action type: {action_type}"}
 
 
-def dequeue_one() -> Optional[Dict[str, Any]]:
+def process_actions_queue_once():
     """
-    Calls your Postgres RPC: public.dequeue_action
-    Must exist in Supabase.
+    Claims a single action and processes it.
+    Returns a small status dict for debugging.
     """
-    args = {}
-    if FIILTHY_WORKER_PROJECT_ID:
-        args["p_project_id"] = FIILTHY_WORKER_PROJECT_ID
+    global _worker_last_error
 
-    res = sb.rpc("dequeue_action", args).execute()
-    return res.data  # dict or None
+    if sb is None:
+        return {"error": "Supabase not configured"}
 
+    row = claim_one_pending_action()
+    if not row:
+        return {"claimed": False}
 
-def finish_one(job_id: str, status: str, error: Optional[str] = None):
-    """
-    Calls your Postgres RPC: public.finish_action
-    Must exist in Supabase.
-    """
-    sb.rpc(
-        "finish_action",
-        {"p_id": job_id, "p_status": status, "p_error": error},
-    ).execute()
-
-
-def worker_tick() -> Dict[str, Any]:
-    """
-    Runs exactly 1 job if available.
-    Returns a dict with what happened.
-    """
-    job = dequeue_one()
-    if not job:
-        return {"ran": False}
-
-    job_id = job["id"]
+    action_id = row["id"]
     try:
-        result = execute_action(job)
-        finish_one(job_id, "done", None)
-        return {"ran": True, "id": job_id, "status": "done", "result": result}
+        result = handle_action(row)
+        mark_action_done(action_id, result=result)
+        return {"claimed": True, "action_id": action_id, "result": result}
     except Exception as e:
-        finish_one(job_id, "failed", str(e))
-        return {"ran": True, "id": job_id, "status": "failed", "error": str(e)}
+        err = repr(e)
+        _worker_last_error = err
+        mark_action_error(action_id, err=err)
+        return {"claimed": True, "action_id": action_id, "error": err}
 
 
 def worker_loop():
+    global _worker_last_tick, _worker_last_error
     while True:
         try:
-            out = worker_tick()
-            if not out.get("ran"):
-                time.sleep(FIILTHY_WORKER_SLEEP_IDLE)
-            else:
-                time.sleep(FIILTHY_WORKER_SLEEP_BUSY)
-        except Exception:
-            # Avoid crashing the service if Supabase/network hiccups
-            time.sleep(3)
+            _worker_last_tick = utcnow().isoformat()
+            process_actions_queue_once()
+            time.sleep(WORKER_POLL_SECONDS)
+        except Exception as e:
+            _worker_last_error = repr(e)
+            time.sleep(5)
 
 
-def start_worker_once():
+def start_worker_if_enabled():
+    global _worker_started
+    if _worker_started:
+        return
+    if not WORKER_ENABLED:
+        print("Worker disabled (set WORKER=1 to enable).")
+        return
+    _worker_started = True
     t = threading.Thread(target=worker_loop, daemon=True)
     t.start()
+    print("Worker thread started ✅")
 
 
-# Manual tick endpoint (debug on phone / postman)
-@app.post("/actions/worker/tick")
-def worker_tick_endpoint():
-    good, resp = require_supabase()
-    if not good:
-        return resp
-    try:
-        out = worker_tick()
-        return ok(out)
-    except Exception as e:
-        return err("Worker tick failed", 500, str(e))
+# Start the worker when the process boots (Render/Gunicorn loads this module)
+start_worker_if_enabled()
 
 
-# Start background worker when the app boots (Render)
-if FIILTHY_WORKER_ENABLED and sb is not None:
-    start_worker_once()
-
-
-# -----------------------------
-# Run local
-# -----------------------------
+# Optional: allow local run
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
-import time
-
-def process_queue():
-    while True:
-        try:
-            jobs = sb.table("actions_queue") \
-                .select("*") \
-                .eq("status", "pending") \
-                .limit(5) \
-                .execute()
-
-            for job in jobs.data:
-                print("Processing:", job["id"])
-
-                # Example action
-                if job["type"] == "ping":
-                    print("Ping received")
-
-                # Mark done
-                sb.table("actions_queue") \
-                    .update({"status": "done"}) \
-                    .eq("id", job["id"]) \
-                    .execute()
-
-        except Exception as e:
-            print("Worker error:", e)
-
-        time.sleep(5)
+    app.run(host="0.0.0.0", port=port, debug=True)
