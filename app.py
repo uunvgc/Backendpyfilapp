@@ -405,3 +405,18 @@ start_worker_if_enabled()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True) 
+import threading, os, time
+
+def worker_loop():
+    print("✅ Worker loop running...")
+    while True:
+        try:
+            # call your pick_jobs / process logic here
+            # process_batch()
+            pass
+        except Exception as e:
+            print("❌ Worker error:", e)
+        time.sleep(int(os.getenv("POLL_SECONDS", "15")))
+
+if os.getenv("RUN_WORKER", "0") == "1":
+    threading.Thread(target=worker_loop, daemon=True).start()
