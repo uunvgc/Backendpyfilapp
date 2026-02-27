@@ -1,7 +1,7 @@
 import os
 import time
 import random
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -12,15 +12,15 @@ try:
 except Exception:
     create_client = None
 
+# Your logic modules
 from logic.query_builder import build_queries, CompanyProfile
 from logic.scoring import score_lead
 from logic.cache import filter_queries, mark_query_run
 from logic.notify import maybe_alert_hot_lead
 from logic.referrals import ensure_referral_code, attribute_referral
 
-from logic.site_audit import audit_site
-from logic.lead_ai import analyze_lead
 from logic.sources import fetch_reddit, fetch_hn, fetch_indiehackers_rss
+from logic.jobs import enqueue_job, get_job, list_jobs, cancel_job
 
 
 # -----------------------------
@@ -35,22 +35,12 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY", "").strip()
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
 
 HTTP_TIMEOUT = int(os.getenv("FIILTHY_HTTP_TIMEOUT", "20"))
-MAX_SERP_QUERIES_PER_SCAN = int(os.getenv("MAX_SERP_QUERIES_PER_SCAN", "20"))
-SERP_RESULTS_PER_QUERY = int(os.getenv("SERP_RESULTS_PER_QUERY", "10"))
-SERP_SLEEP_SECONDS = float(os.getenv("SERP_SLEEP_SECONDS", "0.2"))
-
-AUTO_ANALYZE_MIN_SCORE = int(os.getenv("AUTO_ANALYZE_MIN_SCORE", "40"))
-
-AUTO_WORKER_ENABLED = (os.getenv("AUTO_WORKER_ENABLED", "true").strip().lower() == "true")
-AUTO_WORKER_POLL_SECONDS = int(os.getenv("AUTO_WORKER_POLL_SECONDS", "15"))
-AUTO_PROJECT_SCAN_INTERVAL_MIN = int(os.getenv("AUTO_PROJECT_SCAN_INTERVAL_MIN", "30"))
-AUTO_DAILY_CAP_DEFAULT = int(os.getenv("AUTO_DAILY_CAP_DEFAULT", "25"))
-AUTO_QUEUE_MIN_SCORE = int(os.getenv("AUTO_QUEUE_MIN_SCORE", "60"))
+MAX_QUERIES_PER_SCAN = int(os.getenv("MAX_QUERIES_PER_SCAN", "20"))
+PER_SOURCE_RESULTS = int(os.getenv("PER_SOURCE_RESULTS", "10"))
+SLEEP_BETWEEN_QUERIES = float(os.getenv("SLEEP_BETWEEN_QUERIES", "0.2"))
 
 DEFAULT_SOURCES = [s.strip() for s in os.getenv("DEFAULT_SOURCES", "serp,reddit,hn,indiehackers").split(",") if s.strip()]
-
-AUTO_LOCK_KEY = "auto_worker"
-AUTO_LOCK_TTL_SECONDS = int(os.getenv("AUTO_LOCK_TTL_SECONDS", "60"))
+DEFAULT_PROJECT_CONCURRENCY = int(os.getenv("DEFAULT_PROJECT_CONCURRENCY", "1"))
 
 ALLOWED_LEAD_STATUSES = {"new", "drafted", "queued", "approved", "sent", "replied", "closed", "lost"}
 
@@ -100,6 +90,12 @@ def now_utc() -> datetime:
 def now_iso() -> str:
     return now_utc().isoformat()
 
+def _safe_int(val, default: int = 0) -> int:
+    try:
+        return int(val)
+    except Exception:
+        return default
+
 def _clean_list(val) -> List[str]:
     if val is None:
         return []
@@ -109,16 +105,6 @@ def _clean_list(val) -> List[str]:
         return [x.strip() for x in val.split(",") if x.strip()]
     return [str(val).strip()] if str(val).strip() else []
 
-def _safe_int(val, default: int = 0) -> int:
-    try:
-        return int(val)
-    except Exception:
-        return default
-
-def day_key(dt: Optional[datetime] = None) -> str:
-    dt = dt or now_utc()
-    return dt.strftime("%Y-%m-%d")
-
 def _sleep_jitter(a=0.2, b=1.0):
     time.sleep(random.uniform(a, b))
 
@@ -127,9 +113,13 @@ def _clean_status(s: str) -> str:
 
 
 # -----------------------------
-# SERP Fetchers (Google)
+# SERP (Google) Fetcher
 # -----------------------------
-def fetch_serp_results(query: str, per_query: int = SERP_RESULTS_PER_QUERY) -> List[Dict[str, str]]:
+def fetch_serp_results(query: str, per_query: int) -> List[Dict[str, str]]:
+    """
+    Returns normalized:
+      {title,url,deep_link,snippet,source}
+    """
     per_query = max(1, min(100, int(per_query)))
 
     if SERPAPI_KEY:
@@ -150,7 +140,13 @@ def fetch_serp_results(query: str, per_query: int = SERP_RESULTS_PER_QUERY) -> L
             url = (res.get("link") or "").strip()
             snippet = (res.get("snippet") or "").strip()
             if title and url:
-                out.append({"title": title, "url": url, "deep_link": url, "snippet": snippet, "source": "serp/google"})
+                out.append({
+                    "title": title,
+                    "url": url,
+                    "deep_link": url,
+                    "snippet": snippet,
+                    "source": "serp/google",
+                })
         return out
 
     if SERPER_API_KEY:
@@ -165,7 +161,13 @@ def fetch_serp_results(query: str, per_query: int = SERP_RESULTS_PER_QUERY) -> L
             url = (res.get("link") or "").strip()
             snippet = (res.get("snippet") or "").strip()
             if title and url:
-                out.append({"title": title, "url": url, "deep_link": url, "snippet": snippet, "source": "serp/google"})
+                out.append({
+                    "title": title,
+                    "url": url,
+                    "deep_link": url,
+                    "snippet": snippet,
+                    "source": "serp/google",
+                })
         return out
 
     return []
@@ -184,14 +186,24 @@ def find_project_by_owner_url(sb, owner_id: str, url: str) -> Optional[dict]:
     rows = resp.data or []
     return rows[0] if rows else None
 
+def project_sources(project: dict) -> List[str]:
+    s = project.get("sources")
+    if isinstance(s, list) and s:
+        return [str(x).strip() for x in s if str(x).strip()]
+    return DEFAULT_SOURCES
+
 def insert_lead(sb, row: dict) -> Optional[dict]:
+    """
+    NOTE: This currently upserts on url only.
+    Best practice is on_conflict="project_id,url" with a unique constraint.
+    """
     if not row.get("url"):
         return None
     resp = sb.table("leads").upsert(row, on_conflict="url").execute()
     data = resp.data or []
     return data[0] if data else row
 
-def list_leads(sb, project_id: Optional[str] = None, limit: int = 50, status: Optional[str] = None) -> List[dict]:
+def list_leads(sb, project_id: Optional[str], limit: int, status: Optional[str]) -> List[dict]:
     q = sb.table("leads").select("*").order("created_at", desc=True).limit(limit)
     if project_id:
         q = q.eq("project_id", project_id)
@@ -201,7 +213,9 @@ def list_leads(sb, project_id: Optional[str] = None, limit: int = 50, status: Op
     return resp.data or []
 
 def latest_positioning(sb, project_id: str) -> dict:
-    audit_resp = (
+    # If you have a site_audits table with positioning, return latest positioning
+    # Safe if table doesn't exist: will throw; you can remove if not using audits yet.
+    resp = (
         sb.table("site_audits")
         .select("positioning")
         .eq("project_id", project_id)
@@ -209,107 +223,20 @@ def latest_positioning(sb, project_id: str) -> dict:
         .limit(1)
         .execute()
     )
-    audits = audit_resp.data or []
-    if not audits:
+    rows = resp.data or []
+    if not rows:
         return {}
-    return audits[0].get("positioning") or {}
-
-def get_auto_projects(sb, limit: int = 50) -> List[dict]:
-    resp = (
-        sb.table("projects")
-        .select("*")
-        .eq("auto_mode", True)
-        .order("created_at", desc=False)
-        .limit(limit)
-        .execute()
-    )
-    return resp.data or []
-
-def reset_daily_if_needed(sb, project: dict) -> dict:
-    p = dict(project)
-    current_day = day_key()
-    stored_day = (p.get("auto_sent_day") or "").strip()
-    if stored_day != current_day:
-        sb.table("projects").update({
-            "auto_sent_day": current_day,
-            "auto_sent_today": 0,
-        }).eq("id", p["id"]).execute()
-        p["auto_sent_day"] = current_day
-        p["auto_sent_today"] = 0
-    return p
-
-def bump_auto_count(sb, project_id: str, delta: int = 1):
-    resp = sb.table("projects").select("auto_sent_today, auto_sent_day").eq("id", project_id).limit(1).execute()
-    rows = resp.data or []
-    if not rows:
-        return
-    row = rows[0]
-    today = day_key()
-    if (row.get("auto_sent_day") or "") != today:
-        current = 0
-    else:
-        current = _safe_int(row.get("auto_sent_today"), 0)
-    sb.table("projects").update({
-        "auto_sent_day": today,
-        "auto_sent_today": current + max(1, int(delta)),
-    }).eq("id", project_id).execute()
-
-def set_auto_last_scan(sb, project_id: str):
-    sb.table("projects").update({"auto_last_scan_at": now_iso()}).eq("id", project_id).execute()
+    return rows[0].get("positioning") or {}
 
 
 # -----------------------------
-# Auto worker lock in Supabase
+# Source fetching
 # -----------------------------
-def acquire_or_renew_lock(sb, holder_id: str) -> bool:
-    now = now_utc()
-    expires = now + timedelta(seconds=AUTO_LOCK_TTL_SECONDS)
-    expires_iso = expires.isoformat()
-
-    resp = sb.table("locks").select("*").eq("key", AUTO_LOCK_KEY).limit(1).execute()
-    rows = resp.data or []
-
-    if not rows:
-        try:
-            sb.table("locks").insert({
-                "key": AUTO_LOCK_KEY,
-                "holder": holder_id,
-                "expires_at": expires_iso,
-            }).execute()
-            return True
-        except Exception:
-            return False
-
-    lock = rows[0]
-    holder = (lock.get("holder") or "").strip()
-    expires_at = lock.get("expires_at")
-    try:
-        exp_dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-    except Exception:
-        exp_dt = None
-
-    is_expired = (exp_dt is None) or (exp_dt < now)
-
-    if holder == holder_id or is_expired:
-        sb.table("locks").update({
-            "holder": holder_id,
-            "expires_at": expires_iso,
-        }).eq("key", AUTO_LOCK_KEY).execute()
-        return True
-
-    return False
-
-
-# -----------------------------
-# Source selection
-# -----------------------------
-def project_sources(project: dict) -> List[str]:
-    s = project.get("sources")
-    if isinstance(s, list) and s:
-        return [str(x).strip() for x in s if str(x).strip()]
-    return DEFAULT_SOURCES
-
-def fetch_from_sources(query: str, project: dict, per_source: int = 10) -> List[Dict[str, str]]:
+def fetch_from_sources(query: str, project: dict, per_source: int) -> List[Dict[str, str]]:
+    """
+    Normalized results:
+      {title,url,deep_link,snippet,source}
+    """
     sources = project_sources(project)
     out: List[Dict[str, str]] = []
 
@@ -323,6 +250,7 @@ def fetch_from_sources(query: str, project: dict, per_source: int = 10) -> List[
         out.extend(fetch_hn(query, limit=per_source, timeout=HTTP_TIMEOUT))
 
     if "indiehackers" in sources:
+        # RSS is not query-based; filter by keywords
         kws = []
         kws.extend(_clean_list(project.get("keywords")))
         if project.get("niche"):
@@ -332,8 +260,9 @@ def fetch_from_sources(query: str, project: dict, per_source: int = 10) -> List[
                 kws.append(tok)
         out.extend(fetch_indiehackers_rss(kws, limit=per_source, timeout=HTTP_TIMEOUT))
 
+    # Deduplicate within batch by deep_link/url
     seen = set()
-    deduped = []
+    deduped: List[Dict[str, str]] = []
     for r in out:
         key = (r.get("deep_link") or r.get("url") or "").strip()
         if not key or key in seen:
@@ -345,7 +274,7 @@ def fetch_from_sources(query: str, project: dict, per_source: int = 10) -> List[
 
 
 # -----------------------------
-# Core scan logic
+# Core scan (used by worker)
 # -----------------------------
 def run_project_scan(
     sb,
@@ -353,11 +282,14 @@ def run_project_scan(
     user_id: str,
     user_email: str,
     project: dict,
-    max_queries: int = MAX_SERP_QUERIES_PER_SCAN,
-    per_source: int = 10,
+    max_queries: int = MAX_QUERIES_PER_SCAN,
+    per_source: int = PER_SOURCE_RESULTS,
 ) -> Dict[str, Any]:
+    """
+    Build queries -> cache filter -> fetch sources -> score -> store leads.
+    Heavy AI analysis happens via jobs (analyze_lead).
+    """
     project_id = project.get("id")
-
     profile = CompanyProfile(
         url=project.get("url") or "",
         name=project.get("name"),
@@ -370,11 +302,7 @@ def run_project_scan(
     queries = filter_queries(sb, queries)
 
     inserted = 0
-    analyzed = 0
-    queued = 0
     errors: List[str] = []
-
-    positioning = latest_positioning(sb, project_id) if project_id else {}
 
     for q in queries:
         try:
@@ -385,12 +313,12 @@ def run_project_scan(
                 title = (res.get("title") or "").strip()
                 deep_link = (res.get("deep_link") or res.get("url") or "").strip()
                 snippet = (res.get("snippet") or "").strip()
-                source = res.get("source") or "unknown"
+                source = (res.get("source") or "unknown").strip()
 
-                if not deep_link or not title:
+                if not title or not deep_link:
                     continue
 
-                base_score, intent, reasons = score_lead(
+                score, intent, reasons = score_lead(
                     title,
                     snippet,
                     url=deep_link,
@@ -406,58 +334,34 @@ def run_project_scan(
                     "url": deep_link,
                     "deep_link": deep_link,
                     "status": "new",
-                    "score": base_score,
+                    "score": int(score),
                     "intent": intent,
                     "reasons": reasons,
                     "created_at": now_iso(),
                 }
 
                 saved = insert_lead(sb, lead_row)
-                if not saved:
-                    continue
+                if saved:
+                    inserted += 1
 
-                inserted += 1
-
-                if base_score >= AUTO_ANALYZE_MIN_SCORE:
+                    # Optional notify (safe)
                     try:
-                        analysis = analyze_lead(saved, positioning)
-                        ai_score = _safe_int(analysis.get("score"), base_score)
-                        final_score = int((base_score * 0.5) + (ai_score * 0.5))
+                        maybe_alert_hot_lead(
+                            sb,
+                            user_id=user_id,
+                            user_email=user_email,
+                            lead_id=str(saved.get("id") or deep_link),
+                            lead_title=title,
+                            lead_url=deep_link,
+                            lead_source=source,
+                            lead_score=int(score),
+                            lead_snippet=snippet,
+                            channel="email",
+                        )
+                    except Exception:
+                        pass
 
-                        new_status = "drafted"
-                        if final_score >= AUTO_QUEUE_MIN_SCORE:
-                            new_status = "queued"
-                            queued += 1
-
-                        sb.table("leads").update({
-                            "score": final_score,
-                            "why_this_is_a_lead": analysis.get("why_this_is_a_lead", ""),
-                            "analysis": analysis,
-                            "status": new_status,
-                            "last_analyzed_at": now_iso(),
-                        }).eq("id", saved.get("id")).execute()
-
-                        analyzed += 1
-                    except Exception as e:
-                        print("AI analysis error:", e)
-
-                try:
-                    maybe_alert_hot_lead(
-                        sb,
-                        user_id=user_id,
-                        user_email=user_email,
-                        lead_id=str(saved.get("id") or deep_link),
-                        lead_title=title,
-                        lead_url=deep_link,
-                        lead_source=source,
-                        lead_score=base_score,
-                        lead_snippet=snippet,
-                        channel="email",
-                    )
-                except Exception as e:
-                    print("Notify error:", e)
-
-            time.sleep(SERP_SLEEP_SECONDS)
+            time.sleep(SLEEP_BETWEEN_QUERIES)
 
         except Exception as e:
             errors.append(f"{q[:80]}... -> {str(e)}")
@@ -467,108 +371,9 @@ def run_project_scan(
         "project_id": project_id,
         "queries_ran": len(queries),
         "inserted": inserted,
-        "auto_analyzed": analyzed,
-        "queued": queued,
         "errors": errors[:10],
         "sources": project_sources(project),
     }
-
-
-# -----------------------------
-# AUTO MODE WORKER
-# -----------------------------
-_AUTO_STATE = {
-    "running": False,
-    "last_tick": None,
-    "holder_id": None,
-    "last_projects": 0,
-    "last_actions": {},
-}
-
-def _auto_worker_loop():
-    sb = None
-    holder_id = f"host:{os.getenv('HOSTNAME','local')}|pid:{os.getpid()}"
-    _AUTO_STATE["holder_id"] = holder_id
-    _AUTO_STATE["running"] = True
-
-    while True:
-        try:
-            _AUTO_STATE["last_tick"] = now_iso()
-            if not AUTO_WORKER_ENABLED:
-                time.sleep(5)
-                continue
-
-            if sb is None:
-                sb = get_supabase()
-
-            if not acquire_or_renew_lock(sb, holder_id):
-                time.sleep(AUTO_WORKER_POLL_SECONDS)
-                continue
-
-            projects = get_auto_projects(sb, limit=50)
-            _AUTO_STATE["last_projects"] = len(projects)
-            actions = {"scanned": 0, "skipped_cap": 0, "skipped_interval": 0, "queued": 0}
-
-            for p in projects:
-                p = reset_daily_if_needed(sb, p)
-
-                cap = _safe_int(p.get("auto_daily_cap"), AUTO_DAILY_CAP_DEFAULT)
-                sent_today = _safe_int(p.get("auto_sent_today"), 0)
-                if sent_today >= cap:
-                    actions["skipped_cap"] += 1
-                    continue
-
-                last_scan = p.get("auto_last_scan_at")
-                should_scan = True
-                if last_scan:
-                    try:
-                        ls = datetime.fromisoformat(str(last_scan).replace("Z", "+00:00"))
-                        mins = (now_utc() - ls).total_seconds() / 60.0
-                        if mins < AUTO_PROJECT_SCAN_INTERVAL_MIN:
-                            should_scan = False
-                    except Exception:
-                        pass
-
-                if not should_scan:
-                    actions["skipped_interval"] += 1
-                    continue
-
-                _sleep_jitter(0.2, 1.2)
-
-                project_id = p["id"]
-                user_id = str(p.get("owner_id") or "")
-                user_email = "unknown@example.com"
-
-                try:
-                    res = run_project_scan(
-                        sb,
-                        user_id=user_id,
-                        user_email=user_email,
-                        project=p,
-                        max_queries=MAX_SERP_QUERIES_PER_SCAN,
-                        per_source=10,
-                    )
-                    set_auto_last_scan(sb, project_id)
-                    actions["scanned"] += 1
-                    actions["queued"] += _safe_int(res.get("queued"), 0)
-                    if _safe_int(res.get("queued"), 0) > 0:
-                        bump_auto_count(sb, project_id, delta=_safe_int(res.get("queued"), 0))
-                except Exception as e:
-                    print("Auto scan error:", e)
-
-            _AUTO_STATE["last_actions"] = actions
-            time.sleep(AUTO_WORKER_POLL_SECONDS)
-
-        except Exception as e:
-            print("Auto worker loop error:", e)
-            time.sleep(5)
-
-try:
-    import threading
-    t = threading.Thread(target=_auto_worker_loop, daemon=True)
-    t.start()
-except Exception:
-    pass
 
 
 # -----------------------------
@@ -589,12 +394,8 @@ def health():
         err = str(e)
     return jsonify({"ok": ok, "supabase": ok, "error": err})
 
-@app.get("/auto/status")
-def auto_status():
-    return jsonify({"ok": True, "state": _AUTO_STATE})
 
-
-# --- Referral endpoints ---
+# -------- Referral (kept for later) --------
 @app.post("/users/<user_id>/referral-code")
 def api_referral_code(user_id):
     sb = get_supabase()
@@ -612,7 +413,7 @@ def api_apply_referral(user_id):
     return jsonify({"ok": True, "attributed": bool(ok)})
 
 
-# --- Projects ---
+# -------- Projects --------
 @app.post("/projects")
 def api_create_project():
     sb = get_supabase()
@@ -631,20 +432,18 @@ def api_create_project():
         return jsonify({"ok": False, "error": "url required"}), 400
 
     existing = find_project_by_owner_url(sb, owner_id, url)
-    if existing:
-        update = {
-            "name": name,
-            "niche": (body.get("niche") or "").strip() or None,
-            "keywords": _clean_list(body.get("keywords")),
-            "locations": _clean_list(body.get("locations")),
-        }
-        if "sources" in body:
-            update["sources"] = _clean_list(body.get("sources"))
-        if "auto_mode" in body:
-            update["auto_mode"] = bool(body.get("auto_mode"))
-        if "auto_daily_cap" in body:
-            update["auto_daily_cap"] = _safe_int(body.get("auto_daily_cap"), AUTO_DAILY_CAP_DEFAULT)
+    update = {
+        "name": name,
+        "niche": (body.get("niche") or "").strip() or None,
+        "keywords": _clean_list(body.get("keywords")),
+        "locations": _clean_list(body.get("locations")),
+    }
+    if "sources" in body:
+        update["sources"] = _clean_list(body.get("sources"))
+    if "max_concurrent_jobs" in body:
+        update["max_concurrent_jobs"] = max(1, _safe_int(body.get("max_concurrent_jobs"), DEFAULT_PROJECT_CONCURRENCY))
 
+    if existing:
         saved = sb.table("projects").update(update).eq("id", existing["id"]).execute()
         return jsonify({"ok": True, "project": (saved.data or [existing])[0], "updated_existing": True})
 
@@ -652,18 +451,13 @@ def api_create_project():
         "owner_id": owner_id,
         "name": name,
         "url": url,
-        "niche": (body.get("niche") or "").strip() or None,
-        "keywords": _clean_list(body.get("keywords")),
-        "locations": _clean_list(body.get("locations")),
-        "sources": _clean_list(body.get("sources")) if "sources" in body else DEFAULT_SOURCES,
-        "auto_mode": bool(body.get("auto_mode")) if "auto_mode" in body else False,
-        "auto_daily_cap": _safe_int(body.get("auto_daily_cap"), AUTO_DAILY_CAP_DEFAULT),
-        "auto_sent_day": day_key(),
-        "auto_sent_today": 0,
-        "auto_last_scan_at": None,
+        "niche": update["niche"],
+        "keywords": update["keywords"],
+        "locations": update["locations"],
+        "sources": update.get("sources") or DEFAULT_SOURCES,
+        "max_concurrent_jobs": update.get("max_concurrent_jobs") or DEFAULT_PROJECT_CONCURRENCY,
         "created_at": now_iso(),
     }
-
     resp = sb.table("projects").insert(row).execute()
     data = resp.data or []
     return jsonify({"ok": True, "project": data[0] if data else row, "updated_existing": False})
@@ -677,8 +471,8 @@ def api_list_projects():
     resp = sb.table("projects").select("*").eq("owner_id", owner_id).order("created_at", desc=True).execute()
     return jsonify({"ok": True, "projects": resp.data or []})
 
-@app.patch("/projects/<project_id>/auto")
-def api_toggle_auto(project_id):
+@app.patch("/projects/<project_id>")
+def api_update_project(project_id):
     sb = get_supabase()
     body = request.get_json(force=True) or {}
 
@@ -686,26 +480,37 @@ def api_toggle_auto(project_id):
     if not user_id:
         return jsonify({"ok": False, "error": "user_id required"}), 400
 
-    project = get_project(sb, project_id)
-    if not project:
+    proj = get_project(sb, project_id)
+    if not proj:
         return jsonify({"ok": False, "error": "Project not found"}), 404
-    if str(project.get("owner_id")) != user_id:
+    if str(proj.get("owner_id")) != user_id:
         return jsonify({"ok": False, "error": "Forbidden"}), 403
 
-    enabled = bool(body.get("enabled"))
-    daily_cap = _safe_int(body.get("daily_cap"), _safe_int(project.get("auto_daily_cap"), AUTO_DAILY_CAP_DEFAULT))
+    update: Dict[str, Any] = {}
+    if "name" in body:
+        update["name"] = (body.get("name") or "").strip()
+    if "url" in body:
+        update["url"] = (body.get("url") or "").strip()
+    if "niche" in body:
+        update["niche"] = (body.get("niche") or "").strip() or None
+    if "keywords" in body:
+        update["keywords"] = _clean_list(body.get("keywords"))
+    if "locations" in body:
+        update["locations"] = _clean_list(body.get("locations"))
+    if "sources" in body:
+        update["sources"] = _clean_list(body.get("sources"))
+    if "max_concurrent_jobs" in body:
+        update["max_concurrent_jobs"] = max(1, _safe_int(body.get("max_concurrent_jobs"), DEFAULT_PROJECT_CONCURRENCY))
 
-    saved = sb.table("projects").update({
-        "auto_mode": enabled,
-        "auto_daily_cap": daily_cap,
-        "auto_sent_day": day_key(),
-        "auto_sent_today": 0,
-    }).eq("id", project_id).execute()
+    update = {k: v for k, v in update.items() if v is not None and v != ""}
+    if not update:
+        return jsonify({"ok": False, "error": "No valid fields to update"}), 400
 
-    return jsonify({"ok": True, "project": (saved.data or [project])[0]})
+    saved = sb.table("projects").update(update).eq("id", project_id).execute()
+    return jsonify({"ok": True, "project": (saved.data or [proj])[0]})
 
 
-# --- Manual scan ---
+# -------- Scan / Audit / Analyze (enqueue jobs) --------
 @app.post("/projects/<project_id>/scan")
 def api_scan_project(project_id):
     sb = get_supabase()
@@ -716,28 +521,103 @@ def api_scan_project(project_id):
     if not user_id or not user_email:
         return jsonify({"ok": False, "error": "user_id and user_email required"}), 400
 
-    project = get_project(sb, project_id)
-    if not project:
+    proj = get_project(sb, project_id)
+    if not proj:
         return jsonify({"ok": False, "error": "Project not found"}), 404
+    if str(proj.get("owner_id")) != user_id:
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
 
-    if "serp" in project_sources(project) and (not SERPAPI_KEY and not SERPER_API_KEY):
-        return jsonify({"ok": False, "error": "SERP enabled but no SERP provider configured."}), 500
+    # If serp is enabled but no key exists, fail early (optional)
+    if "serp" in project_sources(proj) and (not SERPAPI_KEY and not SERPER_API_KEY):
+        return jsonify({"ok": False, "error": "SERP enabled but no SERP provider configured (SERPAPI_KEY or SERPER_API_KEY)."}), 500
 
-    max_q = _safe_int(body.get("max_queries"), MAX_SERP_QUERIES_PER_SCAN)
-    per_source = _safe_int(body.get("per_source"), 10)
-
-    result = run_project_scan(
+    job = enqueue_job(
         sb,
-        user_id=user_id,
-        user_email=user_email,
-        project=project,
-        max_queries=max_q,
-        per_source=per_source,
+        owner_id=user_id,
+        project_id=project_id,
+        job_type="scan_project",
+        payload={
+            "user_email": user_email,
+            "max_queries": _safe_int(body.get("max_queries"), MAX_QUERIES_PER_SCAN),
+            "per_source": _safe_int(body.get("per_source"), PER_SOURCE_RESULTS),
+        },
+        priority=_safe_int(body.get("priority"), 50),
+        max_attempts=_safe_int(body.get("max_attempts"), 5),
     )
-    return jsonify(result)
+    return jsonify({"ok": True, "queued": True, "job": job})
+
+@app.post("/projects/<project_id>/audit")
+def api_audit_project(project_id):
+    """
+    Queues an audit job. Worker will run it (audit_site).
+    """
+    sb = get_supabase()
+    body = request.get_json(force=True) or {}
+
+    user_id = (body.get("user_id") or "").strip()
+    user_email = (body.get("user_email") or "").strip()
+    if not user_id or not user_email:
+        return jsonify({"ok": False, "error": "user_id and user_email required"}), 400
+
+    proj = get_project(sb, project_id)
+    if not proj:
+        return jsonify({"ok": False, "error": "Project not found"}), 404
+    if str(proj.get("owner_id")) != user_id:
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    target_url = (body.get("target_url") or proj.get("url") or "").strip()
+    if not target_url:
+        return jsonify({"ok": False, "error": "No target_url and project has no url"}), 400
+
+    job = enqueue_job(
+        sb,
+        owner_id=user_id,
+        project_id=project_id,
+        job_type="audit_project",
+        payload={"url": target_url},
+        priority=_safe_int(body.get("priority"), 80),
+        max_attempts=_safe_int(body.get("max_attempts"), 3),
+    )
+    return jsonify({"ok": True, "queued": True, "job": job})
+
+@app.post("/leads/<lead_id>/analyze")
+def api_analyze_lead(lead_id):
+    """
+    Queues analysis job (worker will run analyze_lead + update lead).
+    """
+    sb = get_supabase()
+    body = request.get_json(force=True) or {}
+
+    user_id = (body.get("user_id") or "").strip()
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id required"}), 400
+
+    resp = sb.table("leads").select("*").eq("id", lead_id).limit(1).execute()
+    rows = resp.data or []
+    if not rows:
+        return jsonify({"ok": False, "error": "Lead not found"}), 404
+
+    lead = rows[0]
+    project_id = lead.get("project_id")
+    proj = get_project(sb, project_id) if project_id else None
+    if not proj:
+        return jsonify({"ok": False, "error": "Project not found"}), 404
+    if str(proj.get("owner_id")) != user_id:
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    job = enqueue_job(
+        sb,
+        owner_id=user_id,
+        project_id=project_id,
+        job_type="analyze_lead",
+        payload={"lead_id": lead_id},
+        priority=_safe_int(body.get("priority"), 70),
+        max_attempts=_safe_int(body.get("max_attempts"), 3),
+    )
+    return jsonify({"ok": True, "queued": True, "job": job})
 
 
-# --- Leads ---
+# -------- Leads --------
 @app.get("/leads")
 def api_list_leads():
     sb = get_supabase()
@@ -768,10 +648,7 @@ def api_update_lead_status(lead_id):
 
     lead = rows[0]
     project_id = lead.get("project_id")
-    if not project_id:
-        return jsonify({"ok": False, "error": "Lead missing project_id"}), 400
-
-    proj = get_project(sb, project_id)
+    proj = get_project(sb, project_id) if project_id else None
     if not proj:
         return jsonify({"ok": False, "error": "Project not found"}), 404
     if str(proj.get("owner_id")) != user_id:
@@ -803,10 +680,7 @@ def api_set_lead_note(lead_id):
 
     lead = rows[0]
     project_id = lead.get("project_id")
-    if not project_id:
-        return jsonify({"ok": False, "error": "Lead missing project_id"}), 400
-
-    proj = get_project(sb, project_id)
+    proj = get_project(sb, project_id) if project_id else None
     if not proj:
         return jsonify({"ok": False, "error": "Project not found"}), 404
     if str(proj.get("owner_id")) != user_id:
@@ -820,82 +694,90 @@ def api_set_lead_note(lead_id):
     out = (saved.data or [lead])[0]
     return jsonify({"ok": True, "lead": out})
 
-@app.post("/leads/<lead_id>/analyze")
-def api_analyze_lead(lead_id):
+
+# -------- Jobs --------
+@app.post("/jobs")
+def api_create_job():
     sb = get_supabase()
     body = request.get_json(force=True) or {}
 
     user_id = (body.get("user_id") or "").strip()
+    job_type = (body.get("type") or "").strip()
+    project_id = (body.get("project_id") or "").strip() or None
+    payload = body.get("payload") or {}
+    priority = _safe_int(body.get("priority"), 100)
+    run_after_seconds = _safe_int(body.get("run_after_seconds"), 0)
+    max_attempts = _safe_int(body.get("max_attempts"), 5)
+
+    if not user_id or not job_type:
+        return jsonify({"ok": False, "error": "user_id and type required"}), 400
+
+    if project_id:
+        proj = get_project(sb, project_id)
+        if not proj:
+            return jsonify({"ok": False, "error": "Project not found"}), 404
+        if str(proj.get("owner_id")) != user_id:
+            return jsonify({"ok": False, "error": "Forbidden"}), 403
+
+    job = enqueue_job(
+        sb,
+        owner_id=user_id,
+        project_id=project_id,
+        job_type=job_type,
+        payload=payload,
+        priority=priority,
+        run_after_seconds=run_after_seconds,
+        max_attempts=max_attempts,
+    )
+    return jsonify({"ok": True, "job": job})
+
+@app.get("/jobs")
+def api_list_jobs():
+    sb = get_supabase()
+    owner_id = (request.args.get("user_id") or "").strip()
+    project_id = (request.args.get("project_id") or "").strip() or None
+    limit = _safe_int(request.args.get("limit"), 50)
+    limit = max(1, min(200, limit))
+
+    if not owner_id:
+        return jsonify({"ok": False, "error": "user_id required"}), 400
+
+    jobs = list_jobs(sb, owner_id=owner_id, project_id=project_id, limit=limit)
+    return jsonify({"ok": True, "jobs": jobs})
+
+@app.get("/jobs/<job_id>")
+def api_get_job(job_id):
+    sb = get_supabase()
+    user_id = (request.args.get("user_id") or "").strip()
     if not user_id:
         return jsonify({"ok": False, "error": "user_id required"}), 400
 
-    resp = sb.table("leads").select("*").eq("id", lead_id).limit(1).execute()
-    rows = resp.data or []
-    if not rows:
-        return jsonify({"ok": False, "error": "Lead not found"}), 404
+    job = get_job(sb, job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Job not found"}), 404
+    if str(job.get("owner_id")) != user_id:
+        return jsonify({"ok": False, "error": "Forbidden"}), 403
 
-    lead = rows[0]
-    project_id = lead.get("project_id")
-    if not project_id:
-        return jsonify({"ok": False, "error": "Lead missing project_id"}), 400
+    return jsonify({"ok": True, "job": job})
 
-    positioning = latest_positioning(sb, project_id)
-    analysis = analyze_lead(lead, positioning)
-
-    base_score = _safe_int(lead.get("score"), 0)
-    ai_score = _safe_int(analysis.get("score"), base_score)
-    final_score = int((base_score * 0.5) + (ai_score * 0.5))
-
-    new_status = "drafted"
-    if final_score >= AUTO_QUEUE_MIN_SCORE:
-        new_status = "queued"
-
-    sb.table("leads").update({
-        "score": final_score,
-        "why_this_is_a_lead": analysis.get("why_this_is_a_lead", ""),
-        "analysis": analysis,
-        "status": new_status,
-        "last_analyzed_at": now_iso(),
-        "updated_at": now_iso(),
-    }).eq("id", lead_id).execute()
-
-    return jsonify({"ok": True, "lead_id": lead_id, "analysis": analysis, "status": new_status})
-
-
-# --- Site Audit ---
-@app.post("/projects/<project_id>/audit")
-def api_audit_project(project_id):
+@app.post("/jobs/<job_id>/cancel")
+def api_cancel_job(job_id):
     sb = get_supabase()
     body = request.get_json(force=True) or {}
-
     user_id = (body.get("user_id") or "").strip()
-    user_email = (body.get("user_email") or "").strip()
-    if not user_id or not user_email:
-        return jsonify({"ok": False, "error": "user_id and user_email required"}), 400
 
-    project = get_project(sb, project_id)
-    if not project:
-        return jsonify({"ok": False, "error": "Project not found"}), 404
+    if not user_id:
+        return jsonify({"ok": False, "error": "user_id required"}), 400
 
-    target_url = (body.get("target_url") or project.get("url") or "").strip()
-    if not target_url:
-        return jsonify({"ok": False, "error": "Project has no url"}), 400
-
-    audit = audit_site(target_url)
-
-    sb.table("site_audits").insert({
-        "project_id": project_id,
-        "target_url": target_url,
-        "summary": audit.get("summary"),
-        "positioning": audit.get("positioning"),
-        "issues": audit.get("issues"),
-        "quick_wins": audit.get("quick_wins"),
-        "suggested_copy": audit.get("suggested_copy"),
-    }).execute()
-
-    return jsonify({"ok": True, "project_id": project_id, "audit": audit})
+    ok = cancel_job(sb, job_id=job_id, owner_id=user_id)
+    if not ok:
+        return jsonify({"ok": False, "error": "Cannot cancel (not found / forbidden / already finished)"}), 400
+    return jsonify({"ok": True, "cancelled": True, "job_id": job_id})
 
 
+# -----------------------------
+# Main
+# -----------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
