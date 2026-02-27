@@ -420,3 +420,6 @@ def worker_loop():
 
 if os.getenv("RUN_WORKER", "0") == "1":
     threading.Thread(target=worker_loop, daemon=True).start()
+
+host="0.0.0.0"
+port=int(os.environ.get("PORT", 10000))
