@@ -1,16 +1,12 @@
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 
-# Statuses
 JOB_QUEUED = "queued"
 JOB_RUNNING = "running"
 JOB_SUCCEEDED = "succeeded"
 JOB_FAILED = "failed"
 JOB_CANCELLED = "cancelled"
-
-VALID_STATUSES = {JOB_QUEUED, JOB_RUNNING, JOB_SUCCEEDED, JOB_FAILED, JOB_CANCELLED}
-
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -25,9 +21,6 @@ def _safe_int(x, default=0) -> int:
         return default
 
 
-# -----------------------------
-# enqueue / fetch / list
-# -----------------------------
 def enqueue_job(
     sb,
     *,
@@ -72,9 +65,6 @@ def list_jobs(sb, *, owner_id: str, project_id: Optional[str] = None, limit: int
     return resp.data or []
 
 
-# -----------------------------
-# concurrency helpers
-# -----------------------------
 def project_max_concurrency(sb, project_id: str, default: int = 1) -> int:
     resp = sb.table("projects").select("max_concurrent_jobs").eq("id", project_id).limit(1).execute()
     rows = resp.data or []
@@ -85,33 +75,21 @@ def project_max_concurrency(sb, project_id: str, default: int = 1) -> int:
 
 def project_running_count(sb, project_id: str) -> int:
     resp = sb.table("jobs").select("id", count="exact").eq("project_id", project_id).eq("status", JOB_RUNNING).execute()
-    # supabase-py returns count in resp.count sometimes; be defensive
     c = getattr(resp, "count", None)
     if c is not None:
         return int(c)
-    data = resp.data or []
-    return len(data)
+    return len(resp.data or [])
 
 
-# -----------------------------
-# claim job
-# -----------------------------
-def claim_next_job(
-    sb,
-    *,
-    worker_id: str,
-    stale_lock_minutes: int = 15,
-) -> Optional[Dict[str, Any]]:
+def claim_next_job(sb, *, worker_id: str) -> Optional[Dict[str, Any]]:
     """
-    Claims 1 job in a safe-ish way without requiring stored procedures.
-    Steps:
-      1) Find one eligible queued job (sorted by priority, created_at)
-      2) If job has project_id, enforce project concurrency
-      3) Attempt to update status to running with "eq status=queued" guard
+    Safe-ish claim:
+    - fetch a few eligible queued jobs
+    - skip jobs whose project concurrency is maxed
+    - attempt to atomically flip status queued->running using guarded update
     """
-
     now = now_utc()
-    # 1) get one candidate
+
     resp = (
         sb.table("jobs")
         .select("*")
@@ -119,7 +97,7 @@ def claim_next_job(
         .lte("run_after", iso(now))
         .order("priority", desc=False)
         .order("created_at", desc=False)
-        .limit(5)  # pull a few so we can skip ones blocked by concurrency
+        .limit(5)
         .execute()
     )
     candidates = resp.data or []
@@ -130,14 +108,12 @@ def claim_next_job(
         job_id = job["id"]
         project_id = job.get("project_id")
 
-        # 2) concurrency gate
         if project_id:
             max_c = project_max_concurrency(sb, project_id, default=1)
             running = project_running_count(sb, project_id)
             if running >= max_c:
-                continue  # try next candidate
+                continue
 
-        # 3) attempt lock
         upd = (
             sb.table("jobs")
             .update({
@@ -157,9 +133,6 @@ def claim_next_job(
     return None
 
 
-# -----------------------------
-# heartbeats + finish
-# -----------------------------
 def heartbeat_job(sb, *, job_id: str, worker_id: str):
     sb.table("jobs").update({
         "locked_by": worker_id,
@@ -167,23 +140,29 @@ def heartbeat_job(sb, *, job_id: str, worker_id: str):
     }).eq("id", job_id).eq("status", JOB_RUNNING).execute()
 
 
-def succeed_job(sb, *, job_id: str, result: Dict[str, Any]):
-    sb.table("jobs").update({
+def succeed_job(sb, *, job_id: str, result: Dict[str, Any], duration_ms: Optional[int] = None):
+    update = {
         "status": JOB_SUCCEEDED,
         "result": result or {},
         "error": None,
         "locked_by": None,
         "locked_at": None,
-    }).eq("id", job_id).execute()
+    }
+    if duration_ms is not None:
+        update["duration_ms"] = int(duration_ms)
+    sb.table("jobs").update(update).eq("id", job_id).execute()
 
 
-def fail_job(sb, *, job_id: str, error: str):
-    sb.table("jobs").update({
+def fail_job(sb, *, job_id: str, error: str, duration_ms: Optional[int] = None):
+    update = {
         "status": JOB_FAILED,
         "error": (error or "")[:4000],
         "locked_by": None,
         "locked_at": None,
-    }).eq("id", job_id).execute()
+    }
+    if duration_ms is not None:
+        update["duration_ms"] = int(duration_ms)
+    sb.table("jobs").update(update).eq("id", job_id).execute()
 
 
 def retry_job(sb, *, job: Dict[str, Any], error: str, backoff_seconds: int = 30) -> bool:
@@ -206,15 +185,7 @@ def retry_job(sb, *, job: Dict[str, Any], error: str, backoff_seconds: int = 30)
     return True
 
 
-# -----------------------------
-# cancellation
-# -----------------------------
 def cancel_job(sb, *, job_id: str, owner_id: str) -> bool:
-    """
-    Cancels if job belongs to owner and is queued/running.
-    Running jobs may still finish if worker doesn't check cancellation,
-    but we also make workers check status before work starts.
-    """
     resp = sb.table("jobs").select("*").eq("id", job_id).limit(1).execute()
     rows = resp.data or []
     if not rows:
@@ -234,18 +205,7 @@ def cancel_job(sb, *, job_id: str, owner_id: str) -> bool:
     return True
 
 
-# -----------------------------
-# reaper (stuck running jobs -> queued)
-# -----------------------------
-def reap_stuck_jobs(
-    sb,
-    *,
-    stale_minutes: int = 15,
-    limit: int = 50,
-) -> Dict[str, Any]:
-    """
-    Re-queues jobs stuck in running where locked_at < now - stale_minutes.
-    """
+def reap_stuck_jobs(sb, *, stale_minutes: int = 15, limit: int = 50) -> Dict[str, Any]:
     cutoff = now_utc() - timedelta(minutes=max(1, int(stale_minutes)))
 
     resp = (
@@ -270,4 +230,4 @@ def reap_stuck_jobs(
         }).eq("id", job["id"]).execute()
         requeued += 1
 
-    return {"stuck_found": len(stuck), "requeued": requeued, "cutoff": iso(cutoff)} 
+    return {"stuck_found": len(stuck), "requeued": requeued, "cutoff": iso(cutoff)}
