@@ -1,40 +1,4 @@
-# app.py
-import os
-import time
-import json
-import threading
-from datetime import datetime, timezone, timedelta
-
-import requests
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from supabase import create_client
-
-# -----------------------------
-# ENV
-# -----------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()  # SERVICE_ROLE (backend only)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-WORKER_ENABLED = os.getenv("WORKER", "0").strip() == "1"
-WORKER_POLL_SECONDS = int(os.getenv("WORKER_POLL_SECONDS", "3"))
-LOCK_TTL_SECONDS = int(os.getenv("LOCK_TTL_SECONDS", "120"))  # re-claim stuck jobs after this
-
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
-FIILTHY_USER_AGENT = os.getenv("FIILTHY_USER_AGENT", "fiilthy/1.0 (+https://fiilthy)")
-
-# -----------------------------
-# INIT
-# -----------------------------
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    # Don’t crash at import-time; health/envcheck will show missing.
-    sb = None
-else:
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+.    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 _worker_started = False
 _worker_last_tick = None
